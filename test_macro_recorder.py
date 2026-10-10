@@ -1147,7 +1147,7 @@ class TestGeneratedCodeIsSafe(unittest.TestCase):
         tree = ast.parse(mr.ScriptWriter().build(acts, "macro_x"))      # must still be valid Python
         imported = {alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"time", "pyautogui", "pathlib", "pydirectinput"})   # no smuggled "import os"
+        self.assertEqual(imported, {"os", "time", "pyautogui", "pathlib", "pydirectinput", "pynput"})   # no smuggled "import os"
         called = {n.func.attr for n in ast.walk(tree)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         self.assertNotIn("system", called)
@@ -1156,7 +1156,8 @@ class TestGeneratedCodeIsSafe(unittest.TestCase):
         acts = [mr.Action("wait_image", 1.0, image="w.png")]
         text = mr.ScriptWriter().build(acts, 'bad"; import os #')
         compile(text, "evil", "exec")
-        self.assertNotIn('\nimport os', text)
+        self.assertEqual([l for l in text.splitlines() if l.strip().startswith('import os')],
+                         ['import os'])      # only the script's own import, nothing smuggled in
 
 
 class TestScreenSizeCheck(unittest.TestCase):
@@ -1282,7 +1283,7 @@ class TestWholeSession(unittest.TestCase):
              self.mock.patch.object(_mouse_stub, "Listener", MouseListener), \
              self.mock.patch.object(mr.time, "time", lambda: clock[0]), \
              self.mock.patch.object(_fake_pyautogui, "screenshot", fake_screenshot), \
-             self.mock.patch("builtins.input", return_value="n"), \
+             self.mock.patch("builtins.input", side_effect=AssertionError("must not ask anything")), \
              contextlib.redirect_stdout(io.StringIO()) as out:
             mr.record(backend="pyautogui")
 
@@ -1976,6 +1977,64 @@ class TestRecordingsFolder(unittest.TestCase):
             path = mr.ScriptWriter().save([mr.Action("click", 1.0, x=1, y=1, value="left")],
                                           "macro_x", folder=Path(tmp))
             self.assertEqual(path, Path(tmp) / "macro_x.py")
+
+
+class TestStopKey(unittest.TestCase):
+    """F10 (STOP_KEY) stops a running macro and lets go of anything it is holding."""
+
+    run_script = TestBackendSwitch.run_script
+
+    def stop_with(self, actions, key_name="f10", edits=()):
+        """Run the script's start-up with a fake keyboard, press a key, return (events, exit codes)."""
+        listeners, exits = [], []
+        class Listener:
+            def __init__(self, on_press=None, **kw): self.on_press = on_press; listeners.append(self)
+            def start(self): pass
+        real_listener = _keyboard_stub.Listener
+        _keyboard_stub.Listener = Listener
+        try:
+            with unittest.mock.patch("os._exit", lambda code: exits.append(code)):
+                events, out, text = self.run_script(actions, edits=edits)
+                self.assertEqual(len(listeners), 1 if "STOP_KEY = \"\"" not in text else 0)
+                events.clear()
+                if listeners:
+                    listeners[0].on_press(types.SimpleNamespace(name=key_name))
+        finally:
+            _keyboard_stub.Listener = real_listener
+        return events, exits
+
+    HOLDS = [mr.Action("hold", 1.0, keys=("w",), end_time=3.0),
+             mr.Action("click", 1.5, x=5, y=6, value="right", mods=("ctrl",), end_time=3.5)]
+
+    def test_stop_key_releases_keys_and_buttons_then_exits(self):
+        events, exits = self.stop_with(self.HOLDS)
+        released = [(e[1], e[2][0] if e[2] else e[3].get("button")) for e in events
+                    if e[1] in ("keyUp", "mouseUp")]
+        self.assertIn(("keyUp", "w"), released)
+        self.assertIn(("keyUp", "ctrl"), released)
+        self.assertIn(("mouseUp", "right"), released)
+        self.assertEqual(exits, [0])
+
+    def test_other_keys_do_not_stop_it(self):
+        events, exits = self.stop_with(self.HOLDS, key_name="f11")
+        self.assertEqual((events, exits), ([], []))
+
+    def test_stop_key_can_be_turned_off(self):
+        events, exits = self.stop_with(self.HOLDS, edits=[('STOP_KEY = "f10"', 'STOP_KEY = ""')])
+        self.assertEqual(exits, [])
+
+    def test_script_lists_what_it_may_hold(self):
+        text = mr.ScriptWriter().build(self.HOLDS, "macro_x")
+        self.assertIn("HELD_KEYS = ['ctrl', 'w']", text)
+        self.assertIn("HELD_BUTTONS = ['right']", text)
+
+    def test_script_without_holds_has_empty_lists(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        self.assertIn("HELD_KEYS = []", text)
+
+    def test_stop_key_is_named_in_the_start_message(self):
+        text = mr.ScriptWriter().build(self.HOLDS, "macro_x")
+        self.assertIn("press {STOP_KEY.upper()}", text)
 
 
 class TestRealPydirectinputNames(unittest.TestCase):
