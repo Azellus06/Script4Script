@@ -29,6 +29,8 @@ Hotkeys while recording:
   Ctrl+F8    new step       - starts a new step_N() function in the script
 
 While a generated script runs, F10 stops it (change STOP_KEY at the top of the script).
+Set REPEAT = 0 at the top of a script to loop forever until you stop it,
+and LOOP_DELAY to the seconds to wait between runs.
 
 WARNING: everything you type is saved as plain text in the .jsonl and .py files.
 """
@@ -962,8 +964,9 @@ class ScriptWriter:
             "# ---------- Settings (edit these) ----------",
             f'BACKEND = "{backend}"   # "pydirectinput" works in games (Roblox...); "pyautogui" is for normal apps',
             "SPEED = 1.0      # 2.0 = twice as fast, 0.5 = half speed (divides every wait)",
-            "REPEAT = 1       # how many times to run the whole macro",
+            "REPEAT = 1       # how many times to run the whole macro (0 = forever, until you press the stop key)",
             "COUNTDOWN = 3    # seconds to wait before it starts (time to switch windows)",
+            "LOOP_DELAY = 0   # seconds to wait between runs when REPEAT is more than 1 (plain seconds, SPEED does not change it)",
             'STOP_KEY = "f10"   # press this key to stop the macro at any time ("" turns it off)',
             "NUDGE = True     # games: wiggle the mouse 1 px after moving it so the game notices (try False if clicks misbehave)",
             "",
@@ -1015,9 +1018,13 @@ class ScriptWriter:
             '    print(f"Starting in {COUNTDOWN} seconds... (press {STOP_KEY.upper()} or move the mouse into a screen corner to stop)")',
             "    time.sleep(COUNTDOWN)",
             "    try:",
-            "        for i in range(REPEAT):",
-            '            print(f"Run {i + 1} of {REPEAT}")',
+            "        run_number = 0",
+            "        while REPEAT == 0 or run_number < REPEAT:      # REPEAT = 0 loops until you stop it",
+            "            run_number += 1",
+            '            print(f"Run {run_number}" if REPEAT == 0 else f"Run {run_number} of {REPEAT}")',
             "            run_macro()",
+            "            if LOOP_DELAY and (REPEAT == 0 or run_number < REPEAT):",
+            "                time.sleep(LOOP_DELAY)",
             '        print("Done.")',
             "    except FAILSAFE_ERRORS:",
             '        print("Stopped: the mouse hit the emergency-stop corner.")',

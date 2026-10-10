@@ -2,7 +2,7 @@
 
 A "script maker" for Windows. Do a task once with your mouse and keyboard, press **F9**, and it writes a ready-to-run Python script that repeats it. No hunting for coordinates by hand.
 
-It works in normal apps and in games (Roblox, Minecraft...) for clicking menus, walking with held keys and typing chat.
+It works in normal apps and in games, for clicking menus, walking with held keys and typing chat. Tested in Roblox: clicks register and held keys replay.
 
 ## Install
 
@@ -60,12 +60,14 @@ The generated script has settings at the top:
 ```python
 BACKEND = "pydirectinput"   # "pydirectinput" works in games; "pyautogui" is for normal apps
 SPEED = 1.0      # 2.0 = twice as fast, 0.5 = half speed
-REPEAT = 1       # how many times to run the whole macro
+REPEAT = 1       # how many times to run the whole macro (0 = forever until you stop it)
+LOOP_DELAY = 0   # seconds to wait between runs
 COUNTDOWN = 3    # seconds to wait before it starts
 STOP_KEY = "f10" # press this key to stop at any time ("" turns it off)
 NUDGE = True     # games: wiggle the mouse 1 px after moving it
 ```
 
+- **Loop forever:** set `REPEAT = 0` and the macro repeats until you press the stop key. `LOOP_DELAY` adds a wait (in seconds) between runs.
 - **F10 stops the macro** at any moment. It lets go of every key and mouse button it was holding, so nothing stays stuck down.
 - Moving the mouse into a screen corner also stops it (top-left corner with `pydirectinput`).
 - The script warns you if your screen size differs from the one it was recorded on.
@@ -158,7 +160,7 @@ Arrows, Space and Shift always count as movement. Ordinary typing stays plain te
 python test_macro_recorder.py
 ```
 
-182 tests with fake keyboards, mice and libraries, so they run anywhere without touching your real input. They include a whole recorded session replayed from start to finish and a real Notepad recording. One test checks key names against the real `pydirectinput` and is skipped where it isn't installed.
+190 tests with fake keyboards, mice and libraries, so they run anywhere without touching your real input. They include a whole recorded session replayed from start to finish and a real Notepad recording. One test checks key names against the real `pydirectinput` and is skipped where it isn't installed.
 
 ## Files
 
