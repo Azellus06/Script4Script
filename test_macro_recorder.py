@@ -10,6 +10,7 @@ import sys
 import pathlib
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -154,8 +155,9 @@ class FakeRecorder(mr.Recorder):
         pass   # skip real Win32 call in tests
 
 
-def build_script(actions):
-    return mr.ScriptWriter().build(actions, "macro_test")
+def build_script(actions, backend="pyautogui"):
+    """Most tests replay against a fake pyautogui, so they build for that backend."""
+    return mr.ScriptWriter().build(actions, "macro_test", backend=backend)
 
 
 def compile_script(text):
@@ -649,8 +651,8 @@ class TestExecutedScript(unittest.TestCase):
         exec(compile_script(script), ns)
         ns["find_image"] = lambda name, timeout: None
         clicks = []
-        ns["pyautogui"] = MagicMock()
-        ns["pyautogui"].click = MagicMock(side_effect=lambda *a, **kw: clicks.append(a))
+        ns["inp"] = MagicMock()                      # the library the script clicks with
+        ns["inp"].click = MagicMock(side_effect=lambda *a, **kw: clicks.append(a))
         ns["click_image"]("click_1.png", 5, -3, 842, 517)
         self.assertEqual(clicks[0], (842, 517))
 
@@ -888,6 +890,7 @@ class TestMarkerThenImmediateClick(unittest.TestCase):
 
     def test_second_f8_replaces_the_first_picture(self):
         self.r._on_press(_FakeKeyEnum.f8)
+        self.r._on_release(_FakeKeyEnum.f8)          # a real keyboard releases F8 between presses
         self.r._save_picture.return_value = ("click_2.png", 842, 517)
         self.r._on_press(_FakeKeyEnum.f8)
         self.assertEqual(self.r._pending_image[0], "click_2.png")
@@ -899,6 +902,7 @@ class TestPauseResume(unittest.TestCase):
         self.r = FakeRecorder()
         self.shift_f9 = lambda: (self.r._on_press(make_key(name="shift")),
                                  self.r._on_press(_FakeKeyEnum.f9),
+                                 self.r._on_release(_FakeKeyEnum.f9),
                                  self.r._on_release(make_key(name="shift")))
 
     def test_shift_f9_pauses_and_nothing_is_recorded(self):
@@ -1095,7 +1099,7 @@ class TestGenerateCommand(unittest.TestCase):
         self.assertEqual(out, self.dir / "macro_2026-10-10_110000_regen.py")
         text = out.read_text(encoding="utf-8")
         compile(text, "regen", "exec")
-        self.assertIn("pyautogui.click(842, 517)", text)
+        self.assertIn("inp.click(842, 517)", text)
         self.assertIn("click_image('click_1.png', 8, 3, 9, 9)", text)
         self.assertIn("'macro_2026-10-10_110000_images'", text)    # pictures folder from the meta
 
@@ -1143,7 +1147,7 @@ class TestGeneratedCodeIsSafe(unittest.TestCase):
         tree = ast.parse(mr.ScriptWriter().build(acts, "macro_x"))      # must still be valid Python
         imported = {alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"time", "pyautogui", "pathlib"})    # no smuggled "import os"
+        self.assertEqual(imported, {"time", "pyautogui", "pathlib", "pydirectinput"})   # no smuggled "import os"
         called = {n.func.attr for n in ast.walk(tree)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         self.assertNotIn("system", called)
@@ -1159,7 +1163,7 @@ class TestScreenSizeCheck(unittest.TestCase):
 
     def test_script_warns_when_screen_differs(self):
         text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")],
-                                       "macro_x", screen=(1920, 1080))
+                                       "macro_x", screen=(1920, 1080), backend="pyautogui")
         self.assertIn("RECORDED_SCREEN = (1920, 1080)", text)
         compile(text, "s", "exec")
         calls, printed = [], []
@@ -1228,22 +1232,28 @@ class TestWholeSession(unittest.TestCase):
             on_click, on_scroll = callbacks["on_click"], callbacks["on_scroll"]
             btn = _FakeButtonEnum.left
             tick = lambda dt: clock.__setitem__(0, clock[0] + dt)
-            shift_combo = lambda k: (kb_press(key(name="shift")), kb_press(k), kb_release(key(name="shift")))
+            shift_combo = lambda k: (kb_press(key(name="shift")), kb_press(k), kb_release(k),
+                                     kb_release(key(name="shift")))
+            tap = lambda k: (kb_press(k), tick(.02), kb_release(k))      # press and let go
 
             tick(1); on_click(842, 517, btn, True); tick(.1); on_click(842, 517, btn, False)
             tick(1)
             for c in "hi":
-                kb_press(key(char=c)); tick(.1)
+                tap(key(char=c)); tick(.1)
             shift_combo(_FakeKeyEnum.f9)                       # pause
             tick(40)                                           # 40 s typing a password...
             for c in "secret":
-                kb_press(key(char=c)); tick(.1)
+                tap(key(char=c)); tick(.1)
             shift_combo(_FakeKeyEnum.f9)                       # resume
-            tick(1); kb_press(_FakeKeyEnum.f8)                 # picture of what is under the mouse
+            tick(1); tap(_FakeKeyEnum.f8)                      # picture of what is under the mouse
             tick(.3); on_click(510, 410, btn, True); tick(.05); on_click(510, 410, btn, False)
             tick(6); shift_combo(_FakeKeyEnum.f8)              # wait-for-image
-            tick(2); kb_press(key(name="ctrl_l")); kb_press(_FakeKeyEnum.f8); kb_release(key(name="ctrl_l"))
-            tick(1); kb_press(key(char="x"))
+            tick(2); kb_press(key(name="ctrl_l")); tap(_FakeKeyEnum.f8); kb_release(key(name="ctrl_l"))
+            tick(1); kb_press(key(char="w")); tick(.5)         # hold W for about 2 s ...
+            for _ in range(10):
+                kb_press(key(char="w")); tick(.03)             # ... the keyboard auto-repeats it ...
+            tick(1.2); kb_release(key(char="w"))               # ... then you let go
+            tick(1); tap(key(char="x"))
             tick(1); kb_press(_FakeKeyEnum.f9)                 # stop
 
         class KbListener:
@@ -1274,12 +1284,12 @@ class TestWholeSession(unittest.TestCase):
              self.mock.patch.object(_fake_pyautogui, "screenshot", fake_screenshot), \
              self.mock.patch("builtins.input", return_value="n"), \
              contextlib.redirect_stdout(io.StringIO()) as out:
-            mr.record()
+            mr.record(backend="pyautogui")
 
         files = sorted(p.name for p in self.dir.iterdir())
-        jsonl = next(self.dir.glob("macro_*.jsonl"))
-        script = next(self.dir.glob("macro_*.py"))
-        images = next(self.dir.glob("macro_*_images"))
+        jsonl = next((self.dir / "recordings").rglob("macro_*.jsonl"))
+        script = next((self.dir / "recordings").rglob("macro_*.py"))
+        images = next((self.dir / "recordings").rglob("macro_*_images"))
         self.assertEqual(sorted(p.name for p in images.iterdir()), ["click_1.png", "wait_2.png"])
 
         raw = jsonl.read_text(encoding="utf-8")
@@ -1287,18 +1297,21 @@ class TestWholeSession(unittest.TestCase):
         self.assertNotIn("secret", raw)                  # paused: the password was never recorded
         self.assertNotIn("secret", text)
         self.assertNotIn("time.sleep(40", text)          # and the 40 s pause is not replayed as a wait
-        self.assertIn("pyautogui.click(842, 517)", text)
-        self.assertIn("pyautogui.write('hi'", text)
+        self.assertIn("inp.click(842, 517)", text)
+        self.assertIn("inp.write('hi'", text)
         # the F8 picture was centered on the mouse at (500, 400); the click at (510, 410) is
         # 10 px right and 10 px below the picture's center; (510, 410) is the fallback spot
         self.assertIn("click_image('click_1.png', 10, 10, 510, 410)", text)
         self.assertIn("wait_for_image('wait_2.png')", text)
         self.assertIn("def step_1():", text)
         self.assertIn("def step_2():", text)
+        self.assertIn("inp.keyDown('w')", text)           # W held about 2 s = one keyDown/keyUp pair ...
+        self.assertIn("inp.keyUp('w')", text)
+        self.assertNotIn("write('w", text)                # ... not a pile of typed w's
         self.assertIn("RECORDED_SCREEN = (1920, 1080)", text)
 
         # regenerating from the recording gives the same script
-        regen = mr.generate(jsonl).read_text(encoding="utf-8")
+        regen = mr.generate(jsonl, backend="pyautogui").read_text(encoding="utf-8")
         strip = lambda t: "\n".join(l for l in t.splitlines() if "Auto-generated" not in l)
         self.assertEqual(strip(regen), strip(text))
 
@@ -1320,10 +1333,665 @@ class TestWholeSession(unittest.TestCase):
                 exec(compile(text, str(script), "exec"), ns)
         finally:
             sys.modules["pyautogui"] = old
-        self.assertEqual([c[0] for c in calls], ["click", "write", "click", "write"])
+        self.assertEqual([c[0] for c in calls], ["click", "write", "click", "keyDown", "keyUp", "write"])
         self.assertEqual(calls[0], ("click", (842, 517)))
         self.assertEqual(calls[2], ("click", (710, 310)))   # picture found at (700, 300) + offset (10, 10)
         self.assertEqual(calls[-1][0], "write")             # the "x" typed in step 2
+
+
+class ClockedRecorder(mr.Recorder):
+    """Recorder with a controllable clock and no Windows key-state lookups, for hold tests."""
+    def __init__(self):
+        super().__init__()
+        self.clock = 1000.0
+        mr.time.time = self._time
+
+    def _time(self):
+        return self.clock
+
+    def _reconcile_mods(self):
+        pass
+
+    def tick(self, seconds):
+        self.clock += seconds
+
+
+class TestHeldKeys(unittest.TestCase):
+    """Holding W to walk: one keyDown / wait / keyUp, not a pile of typed w's."""
+
+    def setUp(self):
+        self._real_time = mr.time.time
+        self.r = ClockedRecorder()
+        self.w = lambda: make_key(char="w")      # a new object each time, like pynput gives
+
+    def tearDown(self):
+        mr.time.time = self._real_time
+
+    def hold_w(self, seconds, repeats=10):
+        self.r._on_press(self.w()); self.r.tick(0.5)             # first press, then the delay
+        for _ in range(repeats):                                 # the keyboard auto-repeats
+            self.r._on_press(self.w()); self.r.tick(0.03)
+        self.r.tick(seconds - 0.5 - 0.03 * repeats)
+        self.r._on_release(self.w())
+
+    def test_auto_repeat_makes_one_press_not_many(self):
+        self.hold_w(2.0)
+        self.assertEqual([a.kind for a in self.r.actions], ["text", "hold"])
+
+    def test_hold_records_start_end_and_keys(self):
+        self.hold_w(2.0)
+        hold = self.r.actions[1]
+        self.assertEqual(hold.keys, ("w",))
+        self.assertEqual(hold.time, self.r.actions[0].time)      # starts when the key went down
+        self.assertAlmostEqual(hold.end_time - hold.time, 2.0)
+
+    def test_quick_tap_is_not_a_hold(self):
+        x = lambda: make_key(char="x")                  # not a movement key
+        self.r._on_press(x()); self.r.tick(0.1); self.r._on_release(x())
+        self.assertEqual([a.kind for a in self.r.actions], ["text"])
+
+    def test_script_for_a_hold(self):
+        self.hold_w(2.0)
+        body = mr.ScriptWriter()._step_body(
+            mr.ScriptWriter()._merge(mr.ScriptWriter()._apply_holds(self.r.actions)))
+        code = "\n".join(body)
+        self.assertIn("inp.keyDown('w')", code)
+        self.assertIn("time.sleep(2.00 / SPEED)", code)
+        self.assertIn("inp.keyUp('w')", code)
+        self.assertNotIn("write", code)                          # the tap was replaced by the hold
+        self.assertLess(code.index("keyDown"), code.index("sleep"))
+        self.assertLess(code.index("sleep"), code.index("keyUp"))
+
+    def test_pressing_the_same_key_again_after_release_counts(self):
+        x = lambda: make_key(char="x")
+        for _ in range(3):
+            self.r._on_press(x()); self.r.tick(0.05); self.r._on_release(x()); self.r.tick(0.1)
+        self.assertEqual(len(self.r.actions), 3)                 # three taps of x, none dropped
+
+    def test_a_missed_release_does_not_block_the_key_forever(self):
+        self.r._on_press(self.w())                               # release never arrives (Win+L...)
+        self.r.tick(5.0)
+        self.r._on_press(self.w())                               # 5 s later: a new press
+        self.assertEqual(len(self.r.actions), 2)
+
+    def test_capital_letter_released_after_shift_is_still_cleared(self):
+        """pynput reports 'H' on press but 'h' on release when Shift is let go first."""
+        self.r._on_press(make_key(name="shift"))
+        self.r._on_press(make_key(char="H")); self.r.tick(0.05)
+        self.r._on_release(make_key(name="shift"))
+        self.r._on_release(make_key(char="h"))
+        self.assertEqual(self.r._down, {})
+        self.r.tick(0.1)
+        self.r._on_press(make_key(char="H"))                     # must NOT be mistaken for a repeat
+        self.assertEqual(len([a for a in self.r.actions if a.kind == "text"]), 2)
+
+    def test_ctrl_c_control_code_is_matched_on_release(self):
+        self.r._on_press(make_key(name="ctrl_l")); self.r._on_press(make_key(char="\x03"))
+        self.r.tick(0.05)
+        self.r._on_release(make_key(name="ctrl_l")); self.r._on_release(make_key(char="c"))
+        self.assertEqual(self.r._down, {})
+
+    def test_shift_w_held_is_a_hold_of_both_keys(self):
+        self.r._on_press(make_key(name="shift"))
+        self.r._on_press(make_key(char="W"))                     # pynput reports a capital
+        self.r.tick(1.5)
+        self.r._on_release(make_key(char="W")); self.r._on_release(make_key(name="shift"))
+        hold = self.r.actions[-1]
+        self.assertEqual((hold.kind, hold.keys), ("hold", ("shift", "w")))
+        w = mr.ScriptWriter()
+        code = "\n".join(w._step_body(w._apply_holds([hold])))
+        self.assertLess(code.index("keyDown('shift')"), code.index("keyDown('w')"))
+        self.assertLess(code.index("keyUp('w')"), code.index("keyUp('shift')"))   # released in reverse
+
+    def test_release_during_a_pause_adds_nothing(self):
+        self.r._on_press(self.w()); self.r.tick(0.1)
+        self.r._toggle_pause()
+        self.r.tick(2.0)
+        self.r._on_release(self.w())
+        self.assertEqual([a.kind for a in self.r.actions], ["text"])
+
+    def test_raising_hold_min_turns_a_hold_back_into_a_tap(self):
+        """The recording keeps the hold; HOLD_MIN decides at generate time what counts as one."""
+        self.hold_w(1.0)
+        old = mr.HOLD_MIN, mr.GAME_HOLD_MIN
+        try:
+            mr.HOLD_MIN = mr.GAME_HOLD_MIN = 2.0
+            kept = mr.ScriptWriter()._apply_holds(self.r.actions)
+        finally:
+            mr.HOLD_MIN, mr.GAME_HOLD_MIN = old
+        self.assertEqual([a.kind for a in kept], ["text"])
+
+    def test_two_different_keys_with_the_same_timestamp_do_not_cancel_each_other(self):
+        """An older Windows clock can stamp two presses with the same time."""
+        taps = [mr.Action("text", 5.0, value="a"), mr.Action("text", 5.0, value="w"),
+                mr.Action("hold", 5.0, keys=("w",), end_time=7.0)]
+        kept = mr.ScriptWriter()._apply_holds(taps)
+        self.assertEqual([(a.kind, a.value) for a in kept if a.kind == "text"], [("text", "a")])
+
+    def test_keys_to_hold_names(self):
+        self.assertEqual(mr.keys_to_hold(mr.Action("text", 0, value="w")), ("w",))
+        self.assertEqual(mr.keys_to_hold(mr.Action("text", 0, value=" ")), ("space",))
+        self.assertEqual(mr.keys_to_hold(mr.Action("text", 0, value="H")), ("shift", "h"))
+        self.assertEqual(mr.keys_to_hold(mr.Action("key", 0, value="up")), ("up",))
+        self.assertEqual(mr.keys_to_hold(mr.Action("hotkey", 0, keys=("ctrl", "c"))), ("ctrl", "c"))
+
+
+class TestHeldMouse(unittest.TestCase):
+
+    def clicked(self, seconds):
+        acts = [mr.Action("click", 10.0, x=842, y=517, value="left", end_time=10.0 + seconds)]
+        w = mr.ScriptWriter()
+        return "\n".join(w._step_body(w._apply_holds(acts)))
+
+    def test_recorder_keeps_the_release_time_of_a_click(self):
+        real = mr.time.time
+        r = ClockedRecorder()
+        try:
+            r.click = lambda x, y, p: r._on_click(x, y, _FakeButtonEnum.left, p)
+            r.click(5, 5, True); r.tick(1.5); r.click(5, 5, False)
+        finally:
+            mr.time.time = real
+        a = r.actions[0]
+        self.assertEqual(a.kind, "click")
+        self.assertAlmostEqual(a.end_time - a.time, 1.5)
+
+    def test_long_press_becomes_mousedown_wait_mouseup(self):
+        code = self.clicked(1.5)
+        self.assertIn("inp.mouseDown(842, 517, button='left')", code)
+        self.assertIn("time.sleep(1.50 / SPEED)", code)
+        self.assertIn("inp.mouseUp(842, 517, button='left')", code)
+        self.assertLess(code.index("mouseDown"), code.index("mouseUp"))
+
+    def test_normal_click_stays_a_click(self):
+        self.assertIn("inp.click(842, 517)", self.clicked(0.1))
+        self.assertNotIn("mouseDown", self.clicked(0.1))
+
+
+class TestBackendSwitch(unittest.TestCase):
+    """The generated script runs against a stand-in pydirectinput / pyautogui that records
+    every call, so we can see exactly what the games backend sends."""
+
+    def run_script(self, actions, backend="pydirectinput", edits=(), raise_in_macro=None):
+        events = []
+        def spy(owner, name):
+            return lambda *a, **k: events.append((owner, name, a, k))
+        pag = types.ModuleType("pyautogui")
+        pag.FailSafeException = type("PagFailSafe", (Exception,), {})
+        pag.size = lambda: (1920, 1080)
+        pag.ImageNotFoundException = type("INF", (Exception,), {})
+        for n in ("click", "write", "press", "hotkey", "keyDown", "keyUp", "moveTo", "dragTo",
+                  "scroll", "hscroll", "mouseDown", "mouseUp"):
+            setattr(pag, n, spy("pyautogui", n))
+        pdi = types.ModuleType("pydirectinput")
+        pdi.FailSafeException = type("PdiFailSafe", (Exception,), {})
+        for n in ("click", "write", "press", "hotkey", "keyDown", "keyUp", "moveTo", "moveRel",
+                  "dragTo", "scroll", "hscroll", "mouseDown", "mouseUp"):
+            setattr(pdi, n, spy("pydirectinput", n))
+        text = mr.ScriptWriter().build(actions, "macro_x", backend=backend).replace("COUNTDOWN = 3", "COUNTDOWN = 0")
+        for old, new in edits:
+            text = text.replace(old, new)
+        saved = {k: sys.modules.get(k) for k in ("pyautogui", "pydirectinput")}
+        sys.modules["pyautogui"], sys.modules["pydirectinput"] = pag, pdi
+        out = []
+        try:
+            with unittest.mock.patch("time.sleep", lambda s: events.append(("sleep", round(s, 3)))), \
+                 unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+                ns = {"__name__": "__main__", "__file__": str(WORKSPACE / "x.py")}
+                if raise_in_macro == "pdi":
+                    text += "\n"
+                    ns["__raise__"] = pdi.FailSafeException
+                exec(compile(text, "generated", "exec"), ns)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        return events, out, text
+
+    def test_default_backend_is_pydirectinput(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        self.assertIn('BACKEND = "pydirectinput"', text)
+
+    def test_bad_backend_name_is_rejected(self):
+        with self.assertRaises(ValueError):
+            mr.ScriptWriter().build([], "macro_x", backend="selenium")
+
+    def test_script_has_both_libraries_so_one_word_flips_it(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x",
+                                       backend="pyautogui")
+        self.assertIn('BACKEND = "pyautogui"', text)
+        self.assertIn("import pydirectinput", text)
+
+    def test_pyautogui_backend_calls_pyautogui_directly(self):
+        events, _, _ = self.run_script([mr.Action("click", 1.0, x=842, y=517, value="left"),
+                                        mr.Action("text", 2.0, value="hi")], backend="pyautogui")
+        calls = [(o, n) for o, n, *_ in (e for e in events if e[0] != "sleep")]
+        self.assertEqual(calls, [("pyautogui", "click"), ("pyautogui", "write")])
+
+    def test_game_click_moves_nudges_rests_then_clicks(self):
+        events, _, _ = self.run_script([mr.Action("click", 1.0, x=842, y=517, value="left")])
+        self.assertEqual(
+            [e for e in events if e[0] != "sleep" or e[1] == 0.05],
+            [("pydirectinput", "moveTo", (842, 517), {}),
+             ("pydirectinput", "moveRel", (1, 0), {"relative": True}),
+             ("pydirectinput", "moveRel", (-1, 0), {"relative": True}),
+             ("sleep", 0.05),
+             ("pydirectinput", "click", (), {"button": "left"})])
+
+    def test_nudge_can_be_switched_off(self):
+        events, _, _ = self.run_script([mr.Action("click", 1.0, x=842, y=517, value="left")],
+                                       edits=[("NUDGE = True", "NUDGE = False")])
+        self.assertNotIn("moveRel", [e[1] for e in events])
+        self.assertIn(("pydirectinput", "moveTo", (842, 517), {}), events)
+
+    def test_right_click_keeps_its_button(self):
+        events, _, _ = self.run_script([mr.Action("click", 1.0, x=5, y=6, value="right")])
+        self.assertIn(("pydirectinput", "click", (), {"button": "right"}), events)
+
+    def test_typing_keeps_capitals_and_symbols(self):
+        events, _, _ = self.run_script([mr.Action("text", 1.0, value="Hello!")])
+        write = next(e for e in events if e[1] == "write")
+        self.assertEqual(write, ("pydirectinput", "write", ("Hello!",), {"interval": 0.05, "auto_shift": True}))
+
+    def test_scroll_is_converted_from_pyautogui_units_to_notches(self):
+        """The recorder writes scroll(-360) = 3 notches down. pydirectinput counts whole
+        notches, so passing -360 through would scroll 360 times."""
+        events, _, _ = self.run_script([mr.Action("scroll", 1.0, x=500, y=400, amount=-3),
+                                        mr.Action("hscroll", 5.0, x=500, y=400, amount=2)])
+        self.assertIn(("pydirectinput", "scroll", (-3,), {}), events)
+        self.assertIn(("pydirectinput", "hscroll", (2,), {}), events)
+        self.assertIn(("pydirectinput", "moveTo", (500, 400), {}), events)   # scroll where it was recorded
+
+    def test_held_key_goes_straight_through(self):
+        events, _, _ = self.run_script([mr.Action("hold", 1.0, keys=("w",), end_time=3.0)])
+        order = [e[1] for e in events if e[1] in ("keyDown", 2.0, "keyUp")]
+        self.assertEqual(order, ["keyDown", 2.0, "keyUp"])
+
+    def test_hotkey_press_drag_go_through(self):
+        events, _, _ = self.run_script([
+            mr.Action("hotkey", 1.0, keys=("ctrl", "c")), mr.Action("key", 2.0, value="enter"),
+            mr.Action("drag", 3.0, x=1, y=2, x2=3, y2=4, value="left", end_time=3.6)])
+        names = [e[1] for e in events if e[0] == "pydirectinput"]
+        self.assertEqual(names, ["hotkey", "keyDown", "keyUp", "moveTo", "dragTo"])   # press = down, short wait, up
+
+    def test_pyautogui_is_still_used_for_the_screen_size_check_and_pictures(self):
+        text = mr.ScriptWriter().build([mr.Action("wait_image", 1.0, image="w.png")], "macro_x")
+        self.assertIn("pyautogui.locateCenterOnScreen", text)
+        self.assertIn("inp.click(spot.x + dx, spot.y + dy, button=button)", text)
+
+    def test_both_emergency_stops_are_caught(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        self.assertIn("pydirectinput.FailSafeException", text)
+        self.assertIn("except FAILSAFE_ERRORS:", text)
+
+    def test_missing_pydirectinput_gives_an_install_hint(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        saved = {k: sys.modules.get(k) for k in ("pyautogui", "pydirectinput")}
+        pag = types.ModuleType("pyautogui"); pag.FailSafeException = Exception
+        sys.modules["pyautogui"], sys.modules["pydirectinput"] = pag, None    # None = import fails
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                exec(compile(text, "g", "exec"), {"__name__": "x", "__file__": str(WORKSPACE / "x.py")})
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        self.assertIn("pip install pydirectinput-rgx", str(ctx.exception))
+
+    def test_cli_backend_option_for_generate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "macro_2026-10-10_120000.jsonl"
+            meta = {"version": mr.LOG_VERSION, "session": "macro_2026-10-10_120000", "screen": [1920, 1080]}
+            al = mr.ActionLog(log, meta); al.append(mr.Action("click", 1.0, x=1, y=1, value="left")); al.close()
+            mr.main(["generate", str(log), "--backend", "pyautogui"])
+            text = (Path(tmp) / "macro_2026-10-10_120000_regen.py").read_text(encoding="utf-8")
+            self.assertIn('BACKEND = "pyautogui"', text)
+            mr.main(["generate", str(log)])
+            text = (Path(tmp) / "macro_2026-10-10_120000_regen.py").read_text(encoding="utf-8")
+            self.assertIn('BACKEND = "pydirectinput"', text)
+
+    def test_cli_backend_option_for_record(self):
+        with unittest.mock.patch.object(mr, "record") as rec:
+            mr.main(["--backend", "pyautogui"])
+            rec.assert_called_once_with(backend="pyautogui")
+        with unittest.mock.patch.object(mr, "record") as rec:
+            mr.main([])
+            rec.assert_called_once_with(backend=mr.BACKEND)
+
+
+class TestCircleWalking(unittest.TestCase):
+    """Walking in a circle: W+D, D+S, S+A, A+W overlap. Down and up must replay at their
+    real times, not one hold after another."""
+
+    run_script = TestBackendSwitch.run_script
+
+    # (key, pressed at, released at) in seconds from the start of the recording
+    CIRCLE = [("w", 0.0, 1.4), ("d", 0.6, 2.2), ("s", 1.6, 3.0), ("a", 2.4, 3.8), ("w", 3.2, 4.5)]
+
+    def record_circle(self):
+        real = mr.time.time
+        r = ClockedRecorder()
+        start = r.clock
+        try:
+            steps = sorted([(t0, "down", k) for k, t0, t1 in self.CIRCLE]
+                           + [(t1, "up", k) for k, t0, t1 in self.CIRCLE])
+            for t, what, k in steps:
+                r.clock = start + t
+                (r._on_press if what == "down" else r._on_release)(make_key(char=k))
+                if what == "down":                       # the keyboard auto-repeats the newest key
+                    r.clock += 0.2; r._on_press(make_key(char=k)); r.clock -= 0.2
+        finally:
+            mr.time.time = real
+        return r.actions
+
+    def timeline(self, events):
+        """{(key, 'down'/'up', n): virtual seconds} from the fake calls and sleeps."""
+        now, seen = 0.0, []
+        for e in events:
+            if e[0] == "sleep":
+                now += e[1]
+            elif e[1] in ("keyDown", "keyUp"):
+                seen.append((e[2][0], "down" if e[1] == "keyDown" else "up", now))
+        return seen
+
+    def test_every_press_and_release_is_recorded(self):
+        kinds = [a.kind for a in self.record_circle()]
+        self.assertEqual(kinds.count("hold"), 5)
+
+    def test_replay_has_the_same_overlaps_and_timing(self):
+        events, _, text = self.run_script(self.record_circle())
+        got = self.timeline(events)
+        want = sorted([(k, "down", t0) for k, t0, t1 in self.CIRCLE]
+                      + [(k, "up", t1) for k, t0, t1 in self.CIRCLE], key=lambda e: e[2])
+        self.assertEqual([(k, d) for k, d, _ in got], [(k, d) for k, d, _ in want])
+        base = got[0][2]
+        for (k, d, t), (_, _, expected) in zip(got, want):
+            self.assertAlmostEqual(t - base, expected - want[0][2], delta=0.03, msg=f"{k} {d}")
+
+    def test_w_is_down_while_d_goes_down(self):
+        events, _, _ = self.run_script(self.record_circle())
+        order = [(e[2][0], e[1]) for e in events if e[1] in ("keyDown", "keyUp")]
+        self.assertEqual(order[:3], [("w", "keyDown"), ("d", "keyDown"), ("w", "keyUp")])
+
+    def test_no_extra_pause_that_would_stretch_the_timing(self):
+        text = self.run_script(self.record_circle())[2]
+        self.assertIn("pyautogui.PAUSE = 0 ", text)
+        self.assertIn("pydirectinput.PAUSE = pyautogui.PAUSE", text)
+
+    def test_ordinary_macro_keeps_the_small_pause(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        self.assertIn("pyautogui.PAUSE = 0.1 / SPEED", text)
+
+    def test_long_click_with_ctrl_replays_as_down_and_up_events(self):
+        acts = [mr.Action("click", 1.0, x=50, y=60, value="right", mods=("ctrl",), end_time=3.5),
+                mr.Action("hold", 2.0, keys=("w",), end_time=3.0)]
+        events, _, _ = self.run_script(acts)
+        names = [e[1] for e in events if e[0] != "sleep"]
+        self.assertEqual(names, ["keyDown", "moveTo", "moveRel", "moveRel", "mouseDown", "keyDown",
+                                 "keyUp", "mouseUp", "keyUp"])
+        # (ctrl down, mouse down, W down, W up, mouse up, ctrl up) with W inside the click
+        self.assertEqual([e[2][0] for e in events if e[1] == "keyDown"], ["ctrl", "w"])
+
+    def test_short_gaps_between_events_are_kept(self):
+        acts = [mr.Action("hold", 1.0, keys=("w",), end_time=2.0),
+                mr.Action("hold", 2.15, keys=("d",), end_time=3.0)]
+        _, _, text = self.run_script(acts)
+        self.assertIn("time.sleep(0.15 / SPEED)", text)
+
+    def test_up_goes_before_down_at_the_same_instant(self):
+        acts = [mr.Action("hold", 1.0, keys=("w",), end_time=2.0),
+                mr.Action("hold", 2.0, keys=("w",), end_time=3.0)]
+        kept = mr.ScriptWriter()._apply_holds(acts)
+        self.assertEqual([a.kind for a in kept], ["keydown", "keyup", "keydown", "keyup"])
+
+
+class TestCtrlBackspaceTwice(unittest.TestCase):
+    """Ctrl held, Backspace pressed twice quickly: both must be recorded."""
+
+    def setUp(self):
+        self._real_time = mr.time.time
+        self.r = ClockedRecorder()
+
+    def tearDown(self):
+        mr.time.time = self._real_time
+
+    def key(self, name=None, char=None, vk=8):
+        k = make_key(name=name, char=char)
+        k.vk = vk                                   # pynput gives Windows keys a virtual-key code
+        return k
+
+    def ctrl(self):
+        return make_key(name="ctrl_l")
+
+    def test_press_as_backspace_release_as_del_character(self):
+        """The reported bug: press and release looked like different keys, so the second
+        press looked like auto-repeat and was dropped."""
+        backspace = self.key(name="backspace")      # pynput's Key.backspace is one shared object
+        self.r._on_press(self.ctrl())
+        for _ in range(2):
+            self.r._on_press(backspace); self.r.tick(0.08)
+            self.r._on_release(self.key(char="\x7f")); self.r.tick(0.2)
+        self.assertEqual([a.keys for a in self.r.actions if a.kind == "hotkey"],
+                         [("ctrl", "backspace"), ("ctrl", "backspace")])
+
+    def test_ctrl_backspace_arriving_as_a_del_character_is_recorded(self):
+        self.r._on_press(self.ctrl())
+        self.r._on_press(self.key(char="\x7f")); self.r.tick(0.08)
+        self.r._on_release(self.key(char="\x7f"))
+        self.assertEqual([(a.kind, a.keys) for a in self.r.actions], [("hotkey", ("ctrl", "backspace"))])
+
+    def test_real_auto_repeat_is_still_ignored(self):
+        self.r._on_press(self.ctrl())
+        self.r._on_press(self.key(name="backspace"))
+        for _ in range(8):
+            self.r.tick(0.03); self.r._on_press(self.key(name="backspace"))
+        self.r._on_release(self.key(name="backspace"))
+        self.assertEqual(len([a for a in self.r.actions if a.kind == "hotkey"]), 1)
+
+    def test_key_id_prefers_the_virtual_key_code(self):
+        self.assertEqual(mr.Recorder._key_id(self.key(name="backspace")),
+                         mr.Recorder._key_id(self.key(char="\x7f")))
+
+    def test_key_without_a_code_still_works(self):
+        self.assertEqual(mr.Recorder._key_id(make_key(char="H")), "h")
+
+
+REAL_NOTEPAD_RECORDING = [
+    {"kind": "click", "time": 1791616943.3001397, "x": 1093, "y": 1048, "value": "left", "end_time": 1791616943.3678715},
+    {"kind": "click", "time": 1791616944.7158573, "x": 378, "y": 319, "value": "left", "end_time": 1791616944.7919827},
+    {"kind": "text", "time": 1791616945.869259, "value": "H", "end_time": 1791616945.869259},
+    {"kind": "text", "time": 1791616946.0702136, "value": "e", "end_time": 1791616946.0702136},
+    {"kind": "text", "time": 1791616946.1622648, "value": "l", "end_time": 1791616946.1622648},
+    {"kind": "text", "time": 1791616946.286218, "value": "l", "end_time": 1791616946.286218},
+    {"kind": "text", "time": 1791616946.4462085, "value": "o", "end_time": 1791616946.4462085},
+    {"kind": "text", "time": 1791616946.5392787, "value": " ", "end_time": 1791616946.5392787},
+    {"kind": "hold", "time": 1791616946.5392787, "keys": ["space"], "end_time": 1791616946.663749},
+    {"kind": "text", "time": 1791616946.9464114, "value": "W", "end_time": 1791616946.9464114},
+    {"kind": "text", "time": 1791616946.9539979, "value": "Q", "end_time": 1791616946.9539979},
+    {"kind": "hold", "time": 1791616946.9464114, "keys": ["shift", "w"], "end_time": 1791616947.0311604},
+    {"kind": "key", "time": 1791616947.4911234, "value": "backspace", "end_time": 1791616947.4911234},
+    {"kind": "text", "time": 1791616947.7651067, "value": "o", "end_time": 1791616947.7651067},
+    {"kind": "text", "time": 1791616947.8772535, "value": "r", "end_time": 1791616947.8772535},
+    {"kind": "text", "time": 1791616947.9923954, "value": "l", "end_time": 1791616947.9923954},
+    {"kind": "text", "time": 1791616948.1134841, "value": "d", "end_time": 1791616948.1134841},
+    {"kind": "hold", "time": 1791616948.1134841, "keys": ["d"], "end_time": 1791616948.198254},
+    {"kind": "hotkey", "time": 1791616948.7564218, "keys": ["ctrl", "backspace"], "end_time": 1791616948.7564218},
+    {"kind": "hotkey", "time": 1791616948.8975964, "keys": ["ctrl", "backspace"], "end_time": 1791616948.8975964},
+    {"kind": "click", "time": 1791616951.5680413, "x": 1100, "y": 1060, "value": "left", "end_time": 1791616951.644276},
+]
+# ^ a real recording: "Hello World" typed with a wrong key (Q) fixed by Backspace, then
+#   Ctrl+Backspace twice. Typing W, D and space must not be mistaken for game movement.
+
+
+class TestRealNotepadRecording(unittest.TestCase):
+
+    run_script = TestBackendSwitch.run_script
+
+    def actions(self):
+        return [mr.Action.from_dict(d) for d in REAL_NOTEPAD_RECORDING]
+
+    def code(self):
+        w = mr.ScriptWriter()
+        return "\n".join(w._step_body(w._merge(sorted(w._apply_holds(self.actions()), key=lambda a: a.time))))
+
+    def test_typing_is_plain_text_not_key_events(self):
+        code = self.code()
+        self.assertNotIn("keyDown", code)
+        self.assertIn("inp.write('Hello WQ'", code)
+        self.assertIn("inp.press('backspace')", code)
+        self.assertIn("inp.write('orld'", code)
+
+    def test_both_ctrl_backspaces_are_in_the_script(self):
+        self.assertEqual(self.code().count("inp.hotkey('ctrl', 'backspace')"), 2)
+
+    def test_replay_sends_two_separate_shortcuts_with_a_gap(self):
+        events, _, _ = self.run_script(self.actions())
+        hot = [i for i, e in enumerate(events) if e[1] == "hotkey"]
+        self.assertEqual(len(hot), 2)
+        self.assertTrue(any(e[0] == "sleep" for e in events[hot[0]:hot[1]]))   # waits between them
+        self.assertEqual(events[hot[0]][3], {"interval": 0.02, "wait": 0.02})
+
+
+class TestTypingVersusMovement(unittest.TestCase):
+
+    def sort(self, acts):
+        return mr.ScriptWriter()._typing_times(acts)
+
+    def text(self, t, ch):
+        return mr.Action("text", t, value=ch)
+
+    def test_a_word_is_typing(self):
+        acts = [self.text(1.0 + i * 0.1, c) for i, c in enumerate("wasd hello")]
+        self.assertTrue(self.sort(acts))
+
+    def test_only_movement_keys_is_not_typing(self):
+        acts = [self.text(1.0 + i * 0.2, c) for i, c in enumerate("wasdw")]
+        self.assertFalse(self.sort(acts))
+
+    def test_movement_then_one_interact_key_is_not_typing(self):
+        acts = [self.text(1.0 + i * 0.2, c) for i, c in enumerate("wawe")]    # e = interact
+        self.assertFalse(self.sort(acts))
+
+    def test_a_pause_between_bursts_separates_them(self):
+        acts = [self.text(1.0, "h"), self.text(1.1, "i"),                    # typing: "hi"
+                self.text(5.0, "w"), self.text(5.2, "a")]                     # later: movement
+        times = self.sort(acts)
+        self.assertIn((1.0, ("h",)), times)
+        self.assertNotIn((5.0, ("w",)), times)
+
+    def test_a_long_hold_inside_typing_is_kept(self):
+        acts = [self.text(1.0, "h"), self.text(1.1, "e"), self.text(1.2, "d"),
+                mr.Action("hold", 1.2, keys=("d",), end_time=2.0)]
+        kept = mr.ScriptWriter()._apply_holds(acts)
+        self.assertEqual([a.kind for a in kept].count("keydown"), 1)
+
+
+class TestOtherMovementKeys(unittest.TestCase):
+    """Minecraft with ESDF: those letters are the movement keys, W and A are ordinary letters."""
+
+    def setUp(self):
+        self.old = mr.GAME_KEYS
+        mr.GAME_KEYS = tuple("esdf") + ("up", "down", "left", "right", "space", "shift")
+
+    def tearDown(self):
+        mr.GAME_KEYS = self.old
+
+    def test_esdf_taps_keep_their_length(self):
+        self.assertEqual(mr.hold_min(("e",)), mr.GAME_HOLD_MIN)
+        self.assertEqual(mr.hold_min(("w",)), mr.HOLD_MIN)
+
+    def test_esdf_burst_is_movement_not_typing(self):
+        acts = [mr.Action("text", 1.0 + i * 0.2, value=c) for i, c in enumerate("esdfe")]
+        self.assertFalse(mr.ScriptWriter()._typing_times(acts))
+
+    def test_wa_is_now_typing(self):
+        acts = [mr.Action("text", 1.0 + i * 0.2, value=c) for i, c in enumerate("wa")]
+        self.assertTrue(mr.ScriptWriter()._typing_times(acts))
+
+    def test_default_setting_builds_the_list(self):
+        self.assertIn("MOVEMENT_KEYS", Path(mr.__file__).read_text(encoding="utf-8"))
+
+
+class TestQuickMovementTaps(unittest.TestCase):
+    """The case that failed: tapping w, a, s, d one after another (each press ~0.15 s) while a
+    mouse button is held. Each tap must keep its real length and place on the timeline."""
+
+    run_script = TestBackendSwitch.run_script
+
+    def record(self):
+        real = mr.time.time
+        r = ClockedRecorder()
+        try:
+            r.clock += 0
+            btn = _FakeButtonEnum.left
+            r._on_click(993, 976, btn, True)
+            for k in "wasdwx":
+                r.tick(0.1); r._on_press(make_key(char=k)); r.tick(0.15); r._on_release(make_key(char=k))
+            r.tick(0.5)
+            r._on_click(993, 976, btn, False)
+        finally:
+            mr.time.time = real
+        return r.actions
+
+    def test_each_movement_tap_is_a_timed_press(self):
+        kinds = [a.kind for a in self.record()]
+        self.assertEqual(kinds.count("hold"), 5)          # w a s d w; the x tap stays text
+
+    def test_replay_presses_each_key_for_about_0_15_s(self):
+        events, _, text = self.run_script(self.record())
+        order = [(e[2][0], e[1]) for e in events if e[1] in ("keyDown", "keyUp")]
+        self.assertEqual(order[:4], [("w", "keyDown"), ("w", "keyUp"), ("a", "keyDown"), ("a", "keyUp")])
+        self.assertIn("time.sleep(0.15 / SPEED)", text)
+        self.assertNotIn("write('wasd", text)             # not squashed into typed text
+
+    def test_mouse_stays_down_for_the_whole_walk(self):
+        events, _, _ = self.run_script(self.record())
+        names = [e[1] for e in events if e[0] != "sleep" and e[1] in ("mouseDown", "mouseUp", "keyDown", "write")]
+        self.assertEqual(names[0], "mouseDown")
+        self.assertEqual(names[-1], "mouseUp")
+        now, down_at, up_at = 0.0, None, None
+        for e in events:
+            if e[0] == "sleep": now += e[1]
+            elif e[1] == "mouseDown": down_at = now
+            elif e[1] == "mouseUp": up_at = now
+        self.assertGreater(up_at - down_at, 1.5)           # about 1.1 s of taps + 0.5 s wait + gaps
+
+
+class TestRecordingsFolder(unittest.TestCase):
+
+    def test_session_files_go_in_recordings_subfolder(self):
+        r = mr.Recorder()
+        base = Path(mr.__file__).parent / "recordings"
+        self.assertEqual(r.folder, base / r.session)
+        self.assertEqual(r.log_path, r.folder / f"{r.session}.jsonl")
+        self.assertEqual(r.image_dir, r.folder / f"{r.session}_images")
+
+    def test_save_script_in_the_given_folder(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mr.ScriptWriter().save([mr.Action("click", 1.0, x=1, y=1, value="left")],
+                                          "macro_x", folder=Path(tmp))
+            self.assertEqual(path, Path(tmp) / "macro_x.py")
+
+
+class TestRealPydirectinputNames(unittest.TestCase):
+    """Only runs where pydirectinput-rgx is installed (your Windows PC): every key name this
+    program can put in a script must be one pydirectinput knows."""
+
+    def test_all_key_names_we_emit_are_known(self):
+        try:
+            import pydirectinput
+        except Exception:
+            self.skipTest("pydirectinput is not installed here")
+        names = set(mr.KEY_NAMES.values()) | {"enter", "esc", "tab", "space", "backspace", "delete",
+                  "home", "end", "up", "down", "left", "right", "insert", "ctrl", "shift", "alt", "win"}
+        names |= {f"f{i}" for i in range(1, 13)} | set("abcdefghijklmnopqrstuvwxyz0123456789")
+        unknown = sorted(n for n in names if not pydirectinput.is_valid_key(n))
+        self.assertEqual(unknown, [])
 
 
 if __name__ == "__main__":

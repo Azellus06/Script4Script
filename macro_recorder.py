@@ -3,17 +3,23 @@ Macro Recorder
 
 Record:    python macro_recorder.py
            Do your task normally, press F9 to stop.
-           It saves three things next to this file:
+           It saves three things in recordings/macro_<date>_<time>/ next to this file:
              macro_<date>_<time>.jsonl      the raw recording (every action, saved as it happens)
              macro_<date>_<time>.py         a ready-to-run script made from the recording
              macro_<date>_<time>_images/    pictures from the F8 markers (only if you used them)
-           then asks if you want to replay the script right away.
+           It never asks anything in the terminal, so it also works when started without a console (.pyw).
 
 Regenerate: python macro_recorder.py generate macro_<date>_<time>.jsonl
            Rebuilds a script from a saved recording without re-recording, for example after
            changing MERGE_GAP or MIN_WAIT below. Writes macro_<date>_<time>_regen.py.
 
-Install once:  pip install pynput pyautogui pillow opencv-python
+Install once:  pip install pynput pyautogui pillow opencv-python pydirectinput-rgx
+
+Games (Roblox...): scripts replay with pydirectinput by default, which games accept.
+           Add --backend pyautogui to either command (or edit BACKEND in the script) for normal apps.
+           Keys held longer than HOLD_MIN seconds replay as a real hold (walking with W).
+           Camera / mouse-look is not supported. Use windowed or borderless mode for F8 pictures.
+           If the game runs as administrator, run the script as administrator too.
 
 Hotkeys while recording:
   F9         stop and save
@@ -27,7 +33,6 @@ WARNING: everything you type is saved as plain text in the .jsonl and .py files.
 import argparse
 import ctypes
 import json
-import subprocess
 import sys
 import threading
 import time
@@ -62,6 +67,17 @@ DRAG_MIN_PIXELS = 10    # mouse moved less than this between press and release =
 SCROLL_MERGE_GAP = 0.5  # wheel notches within this many seconds merge into one scroll()
 SCROLL_UNIT = 120       # Windows: one wheel notch = 120 units in pyautogui.scroll()
 IMAGE_W, IMAGE_H = 100, 60   # size (pixels) of the picture saved around your mouse
+BACKEND = "pydirectinput"    # library new scripts replay with: "pydirectinput" works in games
+                             # (Roblox...), "pyautogui" is for normal apps. You can also change
+                             # BACKEND inside any generated script, or use --backend.
+BACKENDS = ("pydirectinput", "pyautogui")
+HOLD_MIN = 0.3          # other keys / mouse buttons held this long or more replay as a hold
+MOVEMENT_KEYS = "wasd"  # your walk keys, one letter each: "esdf" if that is what your game uses
+GAME_KEYS = tuple(MOVEMENT_KEYS) + ("up", "down", "left", "right", "space", "shift")
+GAME_HOLD_MIN = 0.03    # movement keys keep even a quick tap's real length (a 0.1 s tap = a small step)
+RECORDINGS_DIR = "recordings"   # every session gets its own folder in here, next to this file
+EVENT_MIN_WAIT = 0.02   # waits next to key/button down-up events are kept this precisely (circles need it)
+REPEAT_WINDOW = 1.5     # a held key repeats faster than this; a gap longer than this = a new press
 
 KEY_STOP = keyboard.Key.f9      # stops recording
 KEY_MARKER = keyboard.Key.f8    # F8 / Shift+F8 / Ctrl+F8 markers
@@ -102,9 +118,31 @@ KEY_NAMES = {
 LABELS = {
     "click": "click", "image_click": "image click", "drag": "drag",
     "scroll": "scroll", "hscroll": "sideways scroll", "wait_image": "wait for image",
-    "text": "typed text", "key": "key press", "hotkey": "shortcut",
+    "text": "typed text", "key": "key press", "hotkey": "shortcut", "hold": "key hold",
+    "keydown": "key down", "keyup": "key up", "mousedown": "mouse down", "mouseup": "mouse up",
 }
+EVENT_KINDS = ("keydown", "keyup", "mousedown", "mouseup")   # made at generate time from holds
 KINDS = set(LABELS) | {"section"}   # every kind an Action can have (a recording is checked against this)
+
+
+def hold_min(keys):
+    """Shortest press that is kept as a timed down/up: tiny for movement keys (WASD, arrows...),
+    HOLD_MIN for everything else so normal typing still becomes simple write() lines."""
+    return GAME_HOLD_MIN if keys and keys[-1] in GAME_KEYS else HOLD_MIN
+
+
+def keys_to_hold(action):
+    """The key names to press and keep down for a text/key/hotkey Action, e.g. ('w',)
+    for a typed w, ('shift', 'w') for Shift+W, ('space',) for a typed space."""
+    if action.kind == "hotkey":
+        return tuple(action.keys)
+    if action.kind == "key":
+        return (action.value,)
+    if action.value == " ":
+        return ("space",)
+    if len(action.value) == 1 and action.value.isupper():
+        return ("shift", action.value.lower())      # a typed capital H = Shift + h
+    return (action.value,)
 
 # Code pasted into generated scripts that use pictures. __FOLDER__ is replaced
 # with the name of the picture folder.
@@ -138,16 +176,82 @@ def click_image(name, dx, dy, fallback_x, fallback_y, button="left"):
     """Click where the picture is now (plus the recorded offset); else click the old spot."""
     spot = find_image(name, IMAGE_TIMEOUT)
     if spot is not None:
-        pyautogui.click(spot.x + dx, spot.y + dy, button=button)
+        inp.click(spot.x + dx, spot.y + dy, button=button)
     else:
         print(f"Could not find {name}, clicking the recorded spot instead.")
-        pyautogui.click(fallback_x, fallback_y, button=button)
+        inp.click(fallback_x, fallback_y, button=button)
 
 
 def wait_for_image(name):
     """Pause until the picture appears on screen; stop the macro if it never does."""
     if find_image(name, WAIT_TIMEOUT) is None:
         raise SystemExit(f"Stopped: {name} did not appear within {WAIT_TIMEOUT} seconds.")
+'''
+
+# Code pasted into every generated script: picks the library that does the clicking and typing.
+# Everything the script does goes through "inp", so flipping BACKEND at the top is all it takes.
+BACKEND_BLOCK = '''# ---------- Input library ("inp" below is whichever one BACKEND names) ----------
+if BACKEND == "pydirectinput":
+    try:
+        import pydirectinput   # install with: pip install pydirectinput-rgx
+    except ImportError:
+        raise SystemExit('BACKEND is "pydirectinput" but it is not installed. Run: pip install pydirectinput-rgx')
+    pydirectinput.FAILSAFE = True        # mouse into the TOP-LEFT corner = emergency stop
+    pydirectinput.PAUSE = pyautogui.PAUSE   # same small pause as pyautogui (0 when the macro holds keys)
+
+    class GameInput:
+        """pydirectinput plus the tweaks games need (see Script4Script.md)."""
+
+        def __getattr__(self, name):     # anything not defined below goes straight to pydirectinput
+            return getattr(pydirectinput, name)
+
+        def _move(self, x, y):
+            """Move like a real mouse: some games ignore a pointer that jumps without moving."""
+            if x is None:
+                return
+            pydirectinput.moveTo(x, y)
+            if NUDGE:
+                pydirectinput.moveRel(1, 0, relative=True)    # a tiny real-mouse-style move...
+                pydirectinput.moveRel(-1, 0, relative=True)   # ...and back
+            time.sleep(0.05)
+
+        def click(self, x=None, y=None, button="left"):
+            self._move(x, y)
+            pydirectinput.click(button=button)
+
+        def write(self, text, interval=0.0):
+            pydirectinput.write(text, interval=interval, auto_shift=True)   # keeps capitals and symbols
+
+        def press(self, key, presses=1, interval=0.0):
+            for _ in range(presses):                      # a real key stays down a moment; games miss instant taps
+                pydirectinput.keyDown(key)
+                time.sleep(0.03)
+                pydirectinput.keyUp(key)
+
+        def hotkey(self, *keys):
+            pydirectinput.hotkey(*keys, interval=0.02, wait=0.02)
+            time.sleep(0.05)                              # so two shortcuts in a row don't run together
+
+        def mouseDown(self, x=None, y=None, button="left"):
+            self._move(x, y)
+            pydirectinput.mouseDown(button=button)
+
+        def mouseUp(self, x=None, y=None, button="left"):
+            pydirectinput.mouseUp(button=button)          # released where the mouse already is
+
+        def scroll(self, amount, x=None, y=None):
+            self._move(x, y)
+            pydirectinput.scroll(round(amount / 120))     # pyautogui counts 120 per notch, pydirectinput 1
+
+        def hscroll(self, amount, x=None, y=None):
+            self._move(x, y)
+            pydirectinput.hscroll(round(amount / 120))
+
+    inp = GameInput()
+    FAILSAFE_ERRORS = (pyautogui.FailSafeException, pydirectinput.FailSafeException)
+else:
+    inp = pyautogui
+    FAILSAFE_ERRORS = (pyautogui.FailSafeException,)
 '''
 
 
@@ -287,8 +391,10 @@ class Recorder:
         self._press = None   # (x, y, time, mods) of the mouse button that is currently down
         # The script, recording and picture folder share this name, e.g. macro_2026-09-28_143005
         self.session = datetime.now().strftime("macro_%Y-%m-%d_%H%M%S")
-        self.image_dir = Path(__file__).parent / f"{self.session}_images"
-        self.log_path = Path(__file__).parent / f"{self.session}.jsonl"
+        # Everything from one session lives in recordings/<session>/ (created when recording starts)
+        self.folder = Path(__file__).parent / RECORDINGS_DIR / self.session
+        self.image_dir = self.folder / f"{self.session}_images"
+        self.log_path = self.folder / f"{self.session}.jsonl"
         self._mouse = mouse.Controller()   # lets us read the mouse position on F8
         self._marker_count = 0             # numbers the pictures: click_1.png, wait_2.png...
         self._pending_image = None         # (file, center_x, center_y) waiting for your next click
@@ -297,6 +403,25 @@ class Recorder:
         self.paused = False                # Shift+F9 toggles this
         self._paused_at = 0.0              # when the current pause began
         self._pause_offset = 0.0           # total seconds spent paused so far
+        # Keys that are down right now (not modifiers): key id -> {"start", "seen", "action"}.
+        # Lets us skip auto-repeat presses and measure how long a key was held.
+        self._down = {}
+
+    @staticmethod
+    def _key_id(key):
+        """A name for a key that is the same on press and release. The Windows virtual-key code
+        is best: it stays the same whatever Ctrl or Shift is doing (with Ctrl held, Backspace
+        can arrive as Key.backspace on press and as the character '\\x7f' on release, and a
+        press whose release looks different is mistaken for auto-repeat). Without a code, letters
+        are mapped to the plain lowercase letter ('H' -> 'h', Ctrl+C's '\\x03' -> 'c')."""
+        for source in (key, getattr(key, "value", None)):
+            vk = getattr(source, "vk", None)
+            if isinstance(vk, int) and not isinstance(vk, bool):
+                return ("vk", vk)
+        char = getattr(key, "char", None)
+        if isinstance(char, str) and char:
+            return Recorder._char_to_key(char) or char
+        return key
 
     def _now(self):
         """Current time minus the time spent paused, so a pause never becomes a long sleep()."""
@@ -352,7 +477,7 @@ class Recorder:
         self._marker_count += 1
         name = f"{purpose}_{self._marker_count}.png"
         try:
-            self.image_dir.mkdir(exist_ok=True)
+            self.image_dir.mkdir(parents=True, exist_ok=True)
             pyautogui.screenshot(region=(left, top, IMAGE_W, IMAGE_H)).save(self.image_dir / name)
         except Exception as error:
             print(f"  Could not save the picture ({error}). "
@@ -414,7 +539,8 @@ class Recorder:
                 return
 
             # Barely moved = a normal click (recorded at the press position)
-            action = Action("click", t0, x=px, y=py, value=button.name, mods=mods)
+            action = Action("click", t0, x=px, y=py, value=button.name, mods=mods,
+                            end_time=self._now())   # release time: a long press is a hold
             if pending:
                 name, cx, cy = pending
                 if abs(px - cx) <= IMAGE_W // 2 and abs(py - cy) <= IMAGE_H // 2:
@@ -445,6 +571,8 @@ class Recorder:
     @staticmethod
     def _char_to_key(char):
         """Ctrl+letter arrives as a control code ('\\x03' = Ctrl+C); turn it back into 'c'."""
+        if char == "\x7f":                  # Ctrl+Backspace
+            return "backspace"
         if len(char) == 1 and 1 <= ord(char) <= 26:
             return chr(ord(char) + 96)
         if char.isprintable():
@@ -468,6 +596,16 @@ class Recorder:
             # Any other key: first forget modifiers that are not really held down any more
             self._reconcile_mods()
 
+            # Holding a key makes the keyboard repeat it many times a second. Only the first
+            # press counts; the repeats just prove the key is still down.
+            now = self._now()
+            kid = self._key_id(key)
+            entry = self._down.get(kid)
+            if entry is not None and now - entry["seen"] < REPEAT_WINDOW:
+                entry["seen"] = now
+                return
+            entry = self._down[kid] = {"start": now, "seen": now, "action": None}
+
             if key == KEY_STOP:
                 if "shift" in self.held:      # Shift+F9 = pause / resume
                     self._toggle_pause()
@@ -484,58 +622,73 @@ class Recorder:
                     self._marker_image_click()
                 return
 
-            now = self._now()
-
-            # FIX B4/B21: AltGr on Windows synthesises Ctrl_L + Alt_R key-downs,
-            # so self.held already has {"ctrl", "alt"} when the AltGr keycode fires.
-            # Drop alt_gr itself; the real character (e.g. '€') arrives as a separate
-            # KeyCode event handled below.
-            if name == "alt_gr":
-                return
-
-            # Shift alone is not a "combo" for letters (Shift+a already arrives as "A")
-            combo = self.held & {"ctrl", "alt", "win"}
-            char = getattr(key, "char", None)
-
-            # Normal letters, digits, symbols
-            if char is not None:
-                # FIX B21: AltGr characters (e.g. '€' on EU keyboards) arrive with
-                # combo == {"ctrl", "alt"} due to the synthetic keys above.
-                # Treat them as plain text, not as Ctrl+Alt hotkeys.
-                if combo == {"ctrl", "alt"} and char.isprintable() and ord(char) > 127:
-                    self.actions.append(Action("text", now, value=char))
-                    return
-                if combo:
-                    key_name = self._char_to_key(char)
-                    if key_name:
-                        self._add_hotkey(now, key_name)
-                elif char.isprintable():
-                    self.actions.append(Action("text", now, value=char))
-                return
-
-            # Space is text so words merge (but Ctrl+Space is a combo)
-            if key == keyboard.Key.space and not combo:
-                self.actions.append(Action("text", now, value=" "))
-                return
-
-            # Special keys: enter, tab, backspace, arrows, F1-F12...
-            if name is None:
-                # Keys with no .char and no .name (rare hardware-specific keys): skip silently.
-                return
-            key_name = KEY_NAMES.get(name, name)
-            if self.held:                              # e.g. Shift+Tab, Alt+Tab
-                self._add_hotkey(now, key_name)
-            else:
-                self.actions.append(Action("key", now, value=key_name))
+            before = len(self.actions)
+            self._record_key(key, name, now)
+            if len(self.actions) > before:
+                entry["action"] = self.actions[-1]    # remembered so the release can add a hold
         except Exception as exc:
             # FIX B2/B12: never let an exception escape a pynput callback silently
             print(f"  [recorder] _on_press error: {exc}")
+
+    def _record_key(self, key, name, now):
+        """Turn one fresh key press into a text / key / hotkey Action."""
+        # FIX B4/B21: AltGr on Windows synthesises Ctrl_L + Alt_R key-downs,
+        # so self.held already has {"ctrl", "alt"} when the AltGr keycode fires.
+        # Drop alt_gr itself; the real character (e.g. '€') arrives as a separate
+        # KeyCode event handled below.
+        if name == "alt_gr":
+            return
+
+        # Shift alone is not a "combo" for letters (Shift+a already arrives as "A")
+        combo = self.held & {"ctrl", "alt", "win"}
+        char = getattr(key, "char", None)
+
+        # Normal letters, digits, symbols
+        if char is not None:
+            # FIX B21: AltGr characters (e.g. '€' on EU keyboards) arrive with
+            # combo == {"ctrl", "alt"} due to the synthetic keys above.
+            # Treat them as plain text, not as Ctrl+Alt hotkeys.
+            if combo == {"ctrl", "alt"} and char.isprintable() and ord(char) > 127:
+                self.actions.append(Action("text", now, value=char))
+                return
+            if combo:
+                key_name = self._char_to_key(char)
+                if key_name:
+                    self._add_hotkey(now, key_name)
+            elif char.isprintable():
+                self.actions.append(Action("text", now, value=char))
+            return
+
+        # Space is text so words merge (but Ctrl+Space is a combo)
+        if key == keyboard.Key.space and not combo:
+            self.actions.append(Action("text", now, value=" "))
+            return
+
+        # Special keys: enter, tab, backspace, arrows, F1-F12...
+        if name is None:
+            # Keys with no .char and no .name (rare hardware-specific keys): skip silently.
+            return
+        key_name = KEY_NAMES.get(name, name)
+        if self.held:                              # e.g. Shift+Tab, Alt+Tab
+            self._add_hotkey(now, key_name)
+        else:
+            self.actions.append(Action("key", now, value=key_name))
 
     def _on_release(self, key):
         try:
             name = getattr(key, "name", None)
             if name in MODIFIER_NAMES:
                 self.held.discard(MODIFIER_NAMES[name])
+                return
+            entry = self._down.pop(self._key_id(key), None)
+            if entry is None or entry["action"] is None or self.paused:
+                return
+            now = self._now()
+            keys = keys_to_hold(entry["action"])
+            if now - entry["start"] >= hold_min(keys):
+                # Held a while (walking with W, sprinting with Shift+W...): add a "hold" that
+                # replaces the quick press recorded when the key went down.
+                self.actions.append(Action("hold", entry["start"], end_time=now, keys=keys))
         except Exception as exc:
             print(f"  [recorder] _on_release error: {exc}")
 
@@ -562,6 +715,7 @@ class Recorder:
         meta = {"version": LOG_VERSION, "session": self.session,
                 "created": datetime.now().isoformat(timespec="seconds"),
                 "screen": [int(v) for v in pyautogui.size()]}
+        self.folder.mkdir(parents=True, exist_ok=True)
         self.actions = ActionLog(self.log_path, meta)   # every action is also saved to disk
         beep(1000, 200)                              # high beep = recording started
         print("Recording! Do your task now.")
@@ -603,6 +757,52 @@ class ScriptWriter:
                 merged.append(replace(a))            # copy so the originals stay untouched
         return merged
 
+    @staticmethod
+    def _typing_times(actions):
+        """(time, keys) of every typed character that belongs to ordinary typing, like the
+        letters of "Hello World". A burst of typed characters (each within MERGE_GAP of the
+        last) is typing when it has two non-movement characters side by side ("he", "or").
+        A burst of only W/A/S/D/arrows/space is movement, so those keys keep their timing."""
+        plain = lambda a: len(a.value) == 1 and a.value.lower() not in GAME_KEYS and a.value != " "
+        texts = sorted((a for a in actions if a.kind == "text"), key=lambda a: a.time)
+        found, run = set(), []
+        for a in texts + [None]:
+            if a is not None and (not run or a.time - run[-1].time <= MERGE_GAP):
+                run.append(a)
+                continue
+            if any(plain(x) and plain(y) for x, y in zip(run, run[1:])):
+                found |= {(x.time, keys_to_hold(x)) for x in run}
+            run = [a] if a is not None else []
+        return found
+
+    def _apply_holds(self, actions):
+        """Turn holds into separate down / up events on the timeline.
+        A key held HOLD_MIN seconds or more was recorded twice: a quick press when it went
+        down, and a "hold" when it came up. The quick press is dropped and the hold becomes a
+        keydown at its start and a keyup at its end. A mouse press that long gets the same
+        mousedown / mouseup treatment. Because the down and up are separate, holds can overlap
+        (W still down while D goes down), which is what walking in a circle needs."""
+        typing = self._typing_times(actions)
+        # Quick taps inside ordinary typing stay plain text; only long holds are kept there
+        keep = lambda a: (a.end_time - a.time >= hold_min(a.keys)
+                          and ((a.time, tuple(a.keys)) not in typing or a.end_time - a.time >= HOLD_MIN))
+        holds = {(a.time, tuple(a.keys)) for a in actions if a.kind == "hold" and keep(a)}
+        out = []
+        for a in actions:
+            if a.kind == "hold":
+                if keep(a):
+                    out += [Action("keydown", a.time, keys=a.keys),
+                            Action("keyup", a.end_time, keys=a.keys)]
+            elif a.kind in ("text", "key", "hotkey") and (a.time, keys_to_hold(a)) in holds:
+                continue                                  # the quick press the hold replaces
+            elif a.kind == "click" and a.end_time - a.time >= HOLD_MIN:
+                out += [Action("mousedown", a.time, x=a.x, y=a.y, value=a.value, mods=a.mods),
+                        Action("mouseup", a.end_time, x=a.x, y=a.y, value=a.value, mods=a.mods)]
+            else:
+                out.append(a)
+        # By time; at the same instant a release goes before a press (stable sort keeps the rest)
+        return sorted(out, key=lambda a: (a.time, 0 if a.kind in ("keyup", "mouseup") else 1))
+
     def _split_steps(self, merged):
         """Cut the action list at every 'section' marker: [[step 1 actions], [step 2 actions]]."""
         steps, current = [], []
@@ -618,13 +818,21 @@ class ScriptWriter:
         return steps
 
     def _core_code(self, a):
-        """The pyautogui line(s) for one Action (without modifiers or comment)."""
+        """The input line(s) for one Action (without modifiers or comment)."""
         # Text from a recording is turned into code with repr(), so odd characters in a
         # recording (or a hand-edited .jsonl) can never break out of the quotes.
+        if a.kind == "keydown":
+            return [f"inp.keyDown({k!r})" for k in a.keys]
+        if a.kind == "keyup":
+            return [f"inp.keyUp({k!r})" for k in reversed(a.keys)]
+        if a.kind == "mousedown":
+            return [f"inp.mouseDown({a.x}, {a.y}, button={a.value!r})"]
+        if a.kind == "mouseup":
+            return [f"inp.mouseUp({a.x}, {a.y}, button={a.value!r})"]
         if a.kind == "click":
             if a.value == "left":
-                return [f"pyautogui.click({a.x}, {a.y})"]
-            return [f"pyautogui.click({a.x}, {a.y}, button={a.value!r})"]
+                return [f"inp.click({a.x}, {a.y})"]
+            return [f"inp.click({a.x}, {a.y}, button={a.value!r})"]
         if a.kind == "image_click":
             extra = "" if a.value == "left" else f", button={a.value!r}"
             return [f"click_image({a.image!r}, {a.img_dx}, {a.img_dy}, {a.x}, {a.y}{extra})"]
@@ -632,24 +840,24 @@ class ScriptWriter:
             return [f"wait_for_image({a.image!r})"]
         if a.kind == "drag":
             duration = max(0.3, round(a.end_time - a.time, 1))   # too fast a drag can fail
-            return [f"pyautogui.moveTo({a.x}, {a.y})",
-                    f"pyautogui.dragTo({a.x2}, {a.y2}, duration={duration} / SPEED, "
+            return [f"inp.moveTo({a.x}, {a.y})",
+                    f"inp.dragTo({a.x2}, {a.y2}, duration={duration} / SPEED, "
                     f"button={a.value!r})"]
         if a.kind == "scroll":
-            return [f"pyautogui.scroll({a.amount * SCROLL_UNIT}, x={a.x}, y={a.y})"]
+            return [f"inp.scroll({a.amount * SCROLL_UNIT}, x={a.x}, y={a.y})"]
         if a.kind == "hscroll":
-            return [f"pyautogui.hscroll({a.amount * SCROLL_UNIT}, x={a.x}, y={a.y})"]
+            return [f"inp.hscroll({a.amount * SCROLL_UNIT}, x={a.x}, y={a.y})"]
         if a.kind == "hotkey":
-            return [f"pyautogui.hotkey({', '.join(repr(k) for k in a.keys)})"]
+            return [f"inp.hotkey({', '.join(repr(k) for k in a.keys)})"]
         if a.kind == "text":
-            return [f"pyautogui.write({a.value!r}, interval=0.05)"]
-        return [f"pyautogui.press({a.value!r})"]
+            return [f"inp.write({a.value!r}, interval=0.05)"]
+        return [f"inp.press({a.value!r})"]
 
     def _lines_for(self, a):
         """Full code for one Action: hold modifiers, do it, release them, add a comment."""
-        lines = ([f"pyautogui.keyDown({m!r})" for m in a.mods]
-                 + self._core_code(a)
-                 + [f"pyautogui.keyUp({m!r})" for m in reversed(a.mods)])
+        down = [f"inp.keyDown({m!r})" for m in a.mods] if a.kind != "mouseup" else []
+        up = [f"inp.keyUp({m!r})" for m in reversed(a.mods)] if a.kind != "mousedown" else []
+        lines = down + self._core_code(a) + up       # Ctrl held through a mousedown ... mouseup
         label = LABELS[a.kind]
         if a.mods:
             label = "+".join(a.mods) + "+" + label   # e.g. "ctrl+click"
@@ -657,34 +865,45 @@ class ScriptWriter:
         lines[0] += f"  # {label} at {clock}"
         return lines
 
-    def _pause(self, a, prev_end):
+    def _pause(self, a, prev_end, precise=False):
         """A time.sleep line for the gap before `a`. None if there is no previous action,
         if the gap is under MIN_WAIT, or if `a` is a wait-for-image (it waits by itself).
         The gap AFTER a wait-for-image is kept: it is the time you took to react once the
-        picture appeared, and the replay should give the screen the same time to settle."""
+        picture appeared, and the replay should give the screen the same time to settle.
+        precise=True (next to a key/button down or up) keeps gaps as small as EVENT_MIN_WAIT
+        and writes two decimals, so overlapping holds keep their real timing."""
         if prev_end is None or a.kind == "wait_image":
             return None
         gap = a.time - prev_end
+        if precise:
+            return f"time.sleep({gap:.2f} / SPEED)" if gap >= EVENT_MIN_WAIT else None
         return f"time.sleep({gap:.1f} / SPEED)" if gap >= MIN_WAIT else None
 
     def _step_body(self, step):
         """Code lines for one step's actions, with sleeps between them."""
-        body, prev_end = [], None
+        body, prev_end, prev = [], None, None
         for a in step:
-            pause = self._pause(a, prev_end)
+            precise = a.kind in EVENT_KINDS or (prev is not None and prev.kind in EVENT_KINDS)
+            pause = self._pause(a, prev_end, precise)
             if pause:
                 body.append(pause)
             body += self._lines_for(a)
-            prev_end = a.end_time
+            prev_end = a.end_time if prev_end is None else max(prev_end, a.end_time)
+            prev = a
         return body
 
-    def build(self, actions, session, screen=None):
+    def build(self, actions, session, screen=None, backend=BACKEND):
         """Return the full text of the generated script.
-        `screen` is the (width, height) it was recorded on; the script warns if it differs."""
+        `screen` is the (width, height) it was recorded on; the script warns if it differs.
+        `backend` is the library the script starts with ("pydirectinput" or "pyautogui");
+        the script contains both and the BACKEND line at its top flips between them."""
+        if backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, not {backend!r}")
         # Sort by start time because a click/drag is saved when the button is released
-        merged = self._merge(sorted(actions, key=lambda a: a.time))
+        merged = self._merge(sorted(self._apply_holds(actions), key=lambda a: a.time))
         steps = self._split_steps(merged)
         uses_images = any(a.kind in ("image_click", "wait_image") for a in merged)
+        uses_events = any(a.kind in EVENT_KINDS for a in merged)
 
         made = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines = [
@@ -697,12 +916,18 @@ class ScriptWriter:
         lines += [
             "",
             "# ---------- Settings (edit these) ----------",
+            f'BACKEND = "{backend}"   # "pydirectinput" works in games (Roblox...); "pyautogui" is for normal apps',
             "SPEED = 1.0      # 2.0 = twice as fast, 0.5 = half speed (divides every wait)",
             "REPEAT = 1       # how many times to run the whole macro",
             "COUNTDOWN = 3    # seconds to wait before it starts (time to switch windows)",
+            "NUDGE = True     # games: wiggle the mouse 1 px after moving it so the game notices (try False if clicks misbehave)",
             "",
             "pyautogui.FAILSAFE = True        # mouse into a screen corner = emergency stop",
-            "pyautogui.PAUSE = 0.1 / SPEED    # pyautogui's built-in pause after each action",
+            ("pyautogui.PAUSE = 0               # no extra pause: held keys must keep their exact timing"
+             if uses_events else
+             "pyautogui.PAUSE = 0.1 / SPEED    # pyautogui's built-in pause after each action"),
+            "",
+            BACKEND_BLOCK.rstrip("\n"),
         ]
         if screen:
             width, height = (int(v) for v in screen)
@@ -745,21 +970,22 @@ class ScriptWriter:
             '            print(f"Run {i + 1} of {REPEAT}")',
             "            run_macro()",
             '        print("Done.")',
-            "    except pyautogui.FailSafeException:",
-            '        print("Stopped: the mouse hit a screen corner.")',
+            "    except FAILSAFE_ERRORS:",
+            '        print("Stopped: the mouse hit the emergency-stop corner.")',
         ]
         return "\n".join(lines) + "\n"
 
-    def save(self, actions, session, folder=None, suffix="", screen=None):
-        """Write the script (default: next to this file) and return its path.
+    def save(self, actions, session, folder=None, suffix="", screen=None, backend=BACKEND):
+        """Write the script (default: next to this file) and return its path. record() passes
+        the session's own folder in recordings/.
         The pictures folder must sit next to the script, so `folder` is where both live."""
         folder = Path(folder) if folder else Path(__file__).parent
         path = folder / f"{session}{suffix}.py"
-        path.write_text(self.build(actions, session, screen), encoding="utf-8")
+        path.write_text(self.build(actions, session, screen, backend), encoding="utf-8")
         return path
 
 
-def record():
+def record(backend=BACKEND):
     """Record a new macro, save the recording and the script, offer to replay."""
     recorder = Recorder()
     actions = recorder.run()
@@ -767,19 +993,17 @@ def record():
     if not actions:
         print("Nothing was recorded, so no script was made.")
         return
-    path = ScriptWriter().save(actions, recorder.session, screen=pyautogui.size())
+    path = ScriptWriter().save(actions, recorder.session, folder=recorder.folder,
+                               screen=pyautogui.size(), backend=backend)
     print(f"Saved {len(actions)} actions to: {path}")
+    print(f"The script replays with {backend}. To switch, change BACKEND at the top of the script.")
     if recorder.image_dir.exists():
         print(f"Pictures are in: {recorder.image_dir}  (keep this folder next to the script)")
 
-    # Instant replay: run the new script in a separate Python process
-    if input("Run it now? (y/n): ").strip().lower() == "y":
-        subprocess.run([sys.executable, str(path)])
-    else:
-        print(f"Replay it later with:  python \"{path.name}\"")
+    print(f"Replay it with:  python \"{path}\"")
 
 
-def generate(log_file):
+def generate(log_file, backend=BACKEND):
     """Rebuild a script from a saved .jsonl recording, without recording again."""
     log_file = Path(log_file)
     meta, actions = load_log(log_file)
@@ -788,28 +1012,32 @@ def generate(log_file):
             and not (log_file.parent / f"{session}_images").exists():
         print(f"Warning: the pictures folder {session}_images was not found next to the "
               "recording. The script will stop when it needs a picture.")
-    path = ScriptWriter().save(actions, session, folder=log_file.parent,
-                               suffix="_regen", screen=meta.get("screen"))
+    path = ScriptWriter().save(actions, session, folder=log_file.parent, suffix="_regen",
+                               screen=meta.get("screen"), backend=backend)
     print(f"Wrote {len(actions)} actions to: {path}")
     return path
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Record your mouse and keyboard and turn them into a pyautogui script.")
+        description="Record your mouse and keyboard and turn them into a replay script.")
+    parser.add_argument("--backend", choices=BACKENDS, default=BACKEND,
+                        help=f"library the script replays with (default: {BACKEND})")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("record", help="record a new macro (this is the default)")
     gen = commands.add_parser("generate", help="rebuild a script from a saved .jsonl recording")
     gen.add_argument("log", help="path to a macro_*.jsonl recording")
+    gen.add_argument("--backend", choices=BACKENDS, default=argparse.SUPPRESS,
+                     help="library the script replays with")
     args = parser.parse_args(argv)
 
     if args.command == "generate":
         try:
-            generate(args.log)
+            generate(args.log, backend=args.backend)
         except (OSError, ValueError) as error:
             sys.exit(f"Error: {error}")
     else:
-        record()
+        record(backend=args.backend)
 
 
 if __name__ == "__main__":
