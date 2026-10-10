@@ -1,0 +1,5 @@
+__pycache__/
+.vscode/
+macro_2*.py
+macro_2*.jsonl
+macro_2*_images/

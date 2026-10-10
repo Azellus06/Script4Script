@@ -1,0 +1,1330 @@
+"""
+test_macro_recorder.py
+======================
+Unit tests for macro_recorder.py.  Uses fakes for pynput and pyautogui.
+
+Run:  python test_macro_recorder.py
+"""
+
+import sys
+import pathlib
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock
+
+# ---------------------------------------------------------------------------
+# Stub pynput so it loads without real hardware hooks
+# ---------------------------------------------------------------------------
+_pynput_stub = types.ModuleType("pynput")
+_keyboard_stub = types.ModuleType("pynput.keyboard")
+_mouse_stub = types.ModuleType("pynput.mouse")
+
+
+WORKSPACE = pathlib.Path(__file__).resolve().parent   # the folder that holds macro_recorder.py
+
+class _FakeKeyEnum:
+    """Stand-in for pynput.keyboard.Key."""
+    f9 = object()
+    f8 = object()
+    space = object()
+    enter = object()
+    tab = object()
+    backspace = object()
+    shift = object()
+    shift_l = object()
+    shift_r = object()
+    ctrl = object()
+    ctrl_l = object()
+    ctrl_r = object()
+    alt = object()
+    alt_l = object()
+    alt_r = object()
+    cmd = object()
+    cmd_l = object()
+    cmd_r = object()
+    page_up = object()
+    page_down = object()
+    delete = object()
+    home = object()
+
+
+class _FakeKeyboardListener:
+    def __init__(self, on_press=None, on_release=None):
+        self.on_press = on_press
+        self.on_release = on_release
+    def start(self): pass
+    def stop(self): pass
+    def join(self): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+
+
+class _FakeMouseController:
+    position = (500, 400)
+
+
+class _FakeMouseListener:
+    def __init__(self, on_click=None, on_scroll=None):
+        self.on_click = on_click
+        self.on_scroll = on_scroll
+    def start(self): pass
+    def stop(self): pass
+
+
+class _FakeButtonEnum:
+    class left:
+        name = "left"
+    class right:
+        name = "right"
+    class middle:
+        name = "middle"
+
+
+_keyboard_stub.Key = _FakeKeyEnum
+_keyboard_stub.Listener = _FakeKeyboardListener
+_keyboard_stub.KeyCode = None
+_mouse_stub.Controller = _FakeMouseController
+_mouse_stub.Listener = _FakeMouseListener
+_mouse_stub.Button = _FakeButtonEnum
+_pynput_stub.keyboard = _keyboard_stub
+_pynput_stub.mouse = _mouse_stub
+sys.modules["pynput"] = _pynput_stub
+sys.modules["pynput.keyboard"] = _keyboard_stub
+sys.modules["pynput.mouse"] = _mouse_stub
+
+# Stub winsound (a silent Beep, so tests never make noise or fail on non-Windows)
+_winsound_stub = types.ModuleType("winsound")
+_winsound_stub.Beep = lambda freq, ms: None
+sys.modules["winsound"] = _winsound_stub
+
+# Stub ctypes.windll for _reconcile_mods
+import ctypes as _ctypes
+if not hasattr(_ctypes, "windll"):
+    _ctypes.windll = MagicMock()
+
+# Stub pyautogui at import time
+_fake_pyautogui = types.ModuleType("pyautogui")
+_fake_pyautogui.size = lambda: (1920, 1080)
+_fake_pyautogui.screenshot = MagicMock(return_value=MagicMock(save=MagicMock()))
+_fake_pyautogui.FAILSAFE = True
+_fake_pyautogui.PAUSE = 0.1
+_fake_pyautogui.FailSafeException = Exception
+_fake_pyautogui.locateCenterOnScreen = MagicMock()
+_fake_pyautogui.ImageNotFoundException = type("ImageNotFoundException", (Exception,), {})
+sys.modules["pyautogui"] = _fake_pyautogui
+
+# Add the folder holding macro_recorder.py to the path so the import works
+sys.path.insert(0, str(WORKSPACE))
+import macro_recorder as mr
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_key(name=None, char=None):
+    """Minimal pynput Key/KeyCode fake."""
+    k = MagicMock()
+    k.name = name
+    k.char = char
+    return k
+
+
+class FakeRecorder(mr.Recorder):
+    """Recorder with direct event injection instead of real listeners."""
+    def __init__(self):
+        super().__init__()
+
+    def press(self, key):
+        self._on_press(key)
+
+    def release(self, key):
+        self._on_release(key)
+
+    def click(self, x, y, button=None, pressed=True):
+        if button is None:
+            button = _FakeButtonEnum.left
+        self._on_click(x, y, button, pressed)
+
+    def scroll(self, x, y, dx, dy):
+        self._on_scroll(x, y, dx, dy)
+
+    def _reconcile_mods(self):
+        pass   # skip real Win32 call in tests
+
+
+def build_script(actions):
+    return mr.ScriptWriter().build(actions, "macro_test")
+
+
+def compile_script(text):
+    return compile(text, "<generated>", "exec")
+
+
+def exec_script_get_calls(actions):
+    """Execute the generated script against a fake pyautogui; return call list.
+
+    The generated script contains ``import pyautogui``, which resolves via
+    sys.modules.  We temporarily replace that entry with our recorder class
+    so every pyautogui.click/write/etc. is captured.
+    """
+    import sys as _sys
+    script = build_script(actions)
+    calls = []
+
+    class RecPyag:
+        FAILSAFE = True
+        PAUSE = 0.1
+        FailSafeException = Exception
+        def __getattr__(self, name):
+            def _fn(*a, **kw):
+                calls.append((name, a, kw))
+            return _fn
+
+    pyag = RecPyag()
+    _old = _sys.modules.get("pyautogui")
+    _sys.modules["pyautogui"] = pyag
+    try:
+        ns = {
+            "time": MagicMock(),
+            "pyautogui": pyag,
+            "Path": pathlib.Path,
+            "__file__": str(WORKSPACE / "dummy.py"),
+        }
+        ns["time"].sleep = MagicMock()
+        ns["time"].time = MagicMock(return_value=0)
+        exec(compile_script(script), ns)   # defines run_macro, step_N, helpers
+        ns["COUNTDOWN"] = 0
+        ns["time"].sleep = MagicMock()
+        ns["run_macro"]()
+    finally:
+        if _old is None:
+            _sys.modules.pop("pyautogui", None)
+        else:
+            _sys.modules["pyautogui"] = _old
+    return calls
+
+
+
+# ===========================================================================
+# Tests
+# ===========================================================================
+
+class TestTypingMerge(unittest.TestCase):
+
+    def test_fast_typing_merges(self):
+        """h,e,l,l,o typed 0.1 s apart -> single write("hello")."""
+        acts = [mr.Action("text", i * 0.1, value=c) for i, c in enumerate("hello")]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].value, "hello")
+
+    def test_slow_typing_splits(self):
+        """Gap > 1.0 s -> two separate write() calls."""
+        acts = [mr.Action("text", 0.0, value="h"), mr.Action("text", 2.0, value="i")]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 2)
+
+    def test_space_merges_as_text(self):
+        """Spaces count as text and merge into the word."""
+        chars = [("h", 0.0), ("i", 0.1), (" ", 0.2), ("y", 0.3), ("o", 0.4)]
+        acts = [mr.Action("text", t, value=c) for c, t in chars]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].value, "hi yo")
+
+    def test_key_between_text_prevents_merge(self):
+        """A key press between two text chunks breaks the merge."""
+        acts = [
+            mr.Action("text", 0.0, value="a"),
+            mr.Action("key",  0.1, value="enter"),
+            mr.Action("text", 0.2, value="b"),
+        ]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(merged[0].value, "a")
+        self.assertEqual(merged[2].value, "b")
+
+
+class TestHotkeys(unittest.TestCase):
+
+    def setUp(self):
+        self.r = FakeRecorder()
+
+    def test_ctrl_c_from_control_code(self):
+        """Ctrl+C arrives as \x03 -> hotkey("ctrl", "c")."""
+        self.r.press(make_key(name="ctrl_l"))
+        self.r.press(make_key(char=""))
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "hotkey")
+        self.assertEqual(a.keys, ("ctrl", "c"))
+
+    def test_shift_tab(self):
+        """Shift+Tab -> hotkey("shift", "tab")."""
+        self.r.press(make_key(name="shift_l"))
+        self.r.press(make_key(name="tab"))
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "hotkey")
+        self.assertIn("shift", a.keys)
+        self.assertIn("tab", a.keys)
+
+    def test_alt_tab(self):
+        """Alt+Tab -> hotkey("alt", "tab")."""
+        self.r.press(make_key(name="alt_l"))
+        self.r.press(make_key(name="tab"))
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "hotkey")
+        self.assertIn("alt", a.keys)
+        self.assertIn("tab", a.keys)
+
+    def test_ctrl_shift_s(self):
+        """Ctrl+Shift+S char arrives as "S" -> hotkey("ctrl","shift","s")."""
+        self.r.press(make_key(name="ctrl_l"))
+        self.r.press(make_key(name="shift_l"))
+        self.r.press(make_key(char="S"))
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "hotkey")
+        self.assertIn("ctrl", a.keys)
+        self.assertIn("shift", a.keys)
+        self.assertIn("s", a.keys)
+
+    def test_shift_letter_is_text_not_hotkey(self):
+        """Shift+A: char arrives as "A" -> text("A"), not a hotkey."""
+        self.r.press(make_key(name="shift_l"))
+        self.r.press(make_key(char="A"))
+        text_acts = [a for a in self.r.actions if a.kind == "text"]
+        hotkey_acts = [a for a in self.r.actions if a.kind == "hotkey"]
+        self.assertEqual(len(text_acts), 1)
+        self.assertEqual(text_acts[0].value, "A")
+        self.assertEqual(len(hotkey_acts), 0)
+
+    def test_plain_letter_is_text(self):
+        """Just 'a' -> text("a")."""
+        self.r.press(make_key(char="a"))
+        self.assertEqual(self.r.actions[0].kind, "text")
+
+    def test_enter_is_key(self):
+        """Enter alone -> key("enter")."""
+        self.r.press(make_key(name="enter"))
+        self.assertEqual(self.r.actions[0].kind, "key")
+        self.assertEqual(self.r.actions[0].value, "enter")
+
+    def test_modifier_alone_not_recorded(self):
+        """Pressing just Ctrl records nothing."""
+        self.r.press(make_key(name="ctrl_l"))
+        self.assertEqual(len(self.r.actions), 0)
+
+    def test_altgr_euro_is_text_not_hotkey(self):
+        """FIX B21: AltGr+e -> euro sign text, not Ctrl+Alt hotkey."""
+        self.r.press(make_key(name="ctrl_l"))
+        self.r.press(make_key(name="alt_r"))
+        self.r.press(make_key(name="alt_gr"))
+        self.r.press(make_key(char="€"))   # euro, ord=8364 > 127
+        text_acts = [a for a in self.r.actions if a.kind == "text"]
+        hotkey_acts = [a for a in self.r.actions if a.kind == "hotkey"]
+        self.assertEqual(len(text_acts), 1)
+        self.assertEqual(text_acts[0].value, "€")
+        self.assertEqual(len(hotkey_acts), 0)
+
+    def test_ctrl_alt_delete_is_hotkey(self):
+        """Ctrl+Alt+Delete (ASCII special key) stays a hotkey."""
+        self.r.press(make_key(name="ctrl_l"))
+        self.r.press(make_key(name="alt_l"))
+        self.r.press(make_key(name="delete"))
+        hotkey_acts = [a for a in self.r.actions if a.kind == "hotkey"]
+        self.assertGreater(len(hotkey_acts), 0)
+        self.assertIn("delete", hotkey_acts[-1].keys)
+
+
+class TestDragVsClick(unittest.TestCase):
+
+    def setUp(self):
+        self.r = FakeRecorder()
+
+    def test_small_move_is_click(self):
+        """5 px move (< 10) -> click at press position (100,100)."""
+        self.r.click(100, 100, pressed=True)
+        self.r.click(105, 100, pressed=False)
+        self.assertEqual(self.r.actions[0].kind, "click")
+        self.assertEqual(self.r.actions[0].x, 100)
+
+    def test_large_move_is_drag(self):
+        """50 px move -> drag from (100,100) to (150,100)."""
+        self.r.click(100, 100, pressed=True)
+        self.r.click(150, 100, pressed=False)
+        a = self.r.actions[0]
+        self.assertEqual(a.kind, "drag")
+        self.assertEqual(a.x, 100)
+        self.assertEqual(a.x2, 150)
+
+    def test_exactly_threshold_is_drag(self):
+        """Exactly DRAG_MIN_PIXELS=10 -> drag."""
+        self.r.click(100, 100, pressed=True)
+        self.r.click(110, 100, pressed=False)
+        self.assertEqual(self.r.actions[0].kind, "drag")
+
+    def test_right_click_records_button_name(self):
+        self.r.click(200, 200, button=_FakeButtonEnum.right, pressed=True)
+        self.r.click(200, 200, button=_FakeButtonEnum.right, pressed=False)
+        self.assertEqual(self.r.actions[0].value, "right")
+
+    def test_ctrl_click_stores_mods(self):
+        self.r.press(make_key(name="ctrl_l"))
+        self.r.click(300, 300, pressed=True)
+        self.r.click(300, 300, pressed=False)
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "click")
+        self.assertEqual(a.mods, ("ctrl",))
+
+    def test_ctrl_click_generates_keydown_keyup(self):
+        a = mr.Action("click", 0.0, x=100, y=100, value="left", mods=("ctrl",))
+        lines = mr.ScriptWriter()._lines_for(a)
+        self.assertTrue(any("keyDown" in l for l in lines))
+        self.assertTrue(any("keyUp" in l for l in lines))
+
+
+class TestScrollMerge(unittest.TestCase):
+
+    def test_same_direction_merges(self):
+        """3 down-notches within 0.5 s -> one scroll with amount=-3."""
+        acts = [mr.Action("scroll", i * 0.2, x=100, y=100, amount=-1) for i in range(3)]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].amount, -3)
+
+    def test_opposite_direction_splits(self):
+        acts = [mr.Action("scroll", 0.0, x=100, y=100, amount=-1),
+                mr.Action("scroll", 0.2, x=100, y=100, amount=1)]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 2)
+
+    def test_gap_exceeded_splits(self):
+        acts = [mr.Action("scroll", 0.0, x=100, y=100, amount=-1),
+                mr.Action("scroll", 0.6, x=100, y=100, amount=-1)]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 2)
+
+    def test_scroll_unit_in_code(self):
+        a = mr.Action("scroll", 0.0, x=100, y=100, amount=-2)
+        lines = mr.ScriptWriter()._core_code(a)
+        self.assertIn(str(-2 * mr.SCROLL_UNIT), lines[0])
+
+    def test_ctrl_scroll_has_mods(self):
+        r = FakeRecorder()
+        r.press(make_key(name="ctrl_l"))
+        r.scroll(100, 100, 0, -1)
+        self.assertEqual(r.actions[-1].mods, ("ctrl",))
+
+    def test_hscroll_is_separate_action(self):
+        r = FakeRecorder()
+        r.scroll(100, 100, 1, 0)
+        self.assertEqual(r.actions[0].kind, "hscroll")
+
+    def test_hscroll_merges(self):
+        acts = [mr.Action("hscroll", 0.0, x=100, y=100, amount=1),
+                mr.Action("hscroll", 0.3, x=100, y=100, amount=1)]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].amount, 2)
+
+    def test_hscroll_and_scroll_dont_merge(self):
+        acts = [mr.Action("scroll",  0.0, x=100, y=100, amount=-1),
+                mr.Action("hscroll", 0.1, x=100, y=100, amount=-1)]
+        merged = mr.ScriptWriter()._merge(acts)
+        self.assertEqual(len(merged), 2)
+
+
+class TestMarkers(unittest.TestCase):
+
+    def setUp(self):
+        self.r = FakeRecorder()
+        self.r._save_picture = MagicMock(return_value=("click_1.png", 500, 400))
+
+    def _set_pending(self, fname="click_1.png", cx=500, cy=400):
+        with self.r._marker_lock:
+            self.r._pending_image = (fname, cx, cy)
+
+    def test_click_inside_picture_becomes_image_click(self):
+        """Click within 50px/30px of center (500,400) -> image_click."""
+        self._set_pending()
+        self.r.click(510, 410, pressed=True)
+        self.r.click(510, 410, pressed=False)
+        a = self.r.actions[0]
+        self.assertEqual(a.kind, "image_click")
+        self.assertEqual(a.img_dx, 10)
+        self.assertEqual(a.img_dy, 10)
+
+    def test_click_outside_picture_is_plain_click(self):
+        """Click at (700,700) is outside click_1.png centered at (500,400)."""
+        self._set_pending()
+        self.r.click(700, 700, pressed=True)
+        self.r.click(700, 700, pressed=False)
+        self.assertEqual(self.r.actions[0].kind, "click")
+
+    def test_drag_after_f8_drops_marker(self):
+        """Drag after F8 -> drag action; pending cleared."""
+        self._set_pending()
+        self.r.click(100, 100, pressed=True)
+        self.r.click(200, 200, pressed=False)   # 141 px = drag
+        self.assertEqual(self.r.actions[0].kind, "drag")
+        with self.r._marker_lock:
+            self.assertIsNone(self.r._pending_image)
+
+    def test_double_f8_overwrite_detected(self):
+        """FIX B6: second F8 before clicking finds non-None pending."""
+        self._set_pending(fname="click_1.png")
+        overwritten = []
+        new_saved = ("click_2.png", 500, 400)
+        with self.r._marker_lock:
+            if self.r._pending_image is not None:
+                overwritten.append(True)
+            self.r._pending_image = new_saved
+        self.assertTrue(overwritten, "Overwrite was not detected")
+        with self.r._marker_lock:
+            self.assertEqual(self.r._pending_image[0], "click_2.png")
+
+    def test_shift_f8_adds_wait_image_action(self):
+        """Shift+F8 appends wait_image action."""
+        import time as _t
+        t = _t.time()
+        self.r.actions.append(mr.Action("wait_image", t, image="wait_1.png"))
+        a = self.r.actions[-1]
+        self.assertEqual(a.kind, "wait_image")
+        self.assertEqual(a.image, "wait_1.png")
+
+    def test_ctrl_f8_adds_section(self):
+        self.r._marker_section()
+        self.assertEqual(self.r.actions[-1].kind, "section")
+
+    def test_pending_consumed_once(self):
+        """Pending image is cleared after first click; second click is plain."""
+        self._set_pending()
+        self.r.click(505, 402, pressed=True)
+        self.r.click(505, 402, pressed=False)
+        with self.r._marker_lock:
+            self.assertIsNone(self.r._pending_image)
+        self.r.click(505, 402, pressed=True)
+        self.r.click(505, 402, pressed=False)
+        self.assertEqual(self.r.actions[1].kind, "click")
+
+
+class TestStepSplitting(unittest.TestCase):
+
+    def test_no_section_one_step(self):
+        acts = [mr.Action("text", 0.0, value="a"), mr.Action("key", 0.5, value="enter")]
+        steps = mr.ScriptWriter()._split_steps(acts)
+        self.assertEqual(len(steps), 1)
+
+    def test_one_section_two_steps(self):
+        acts = [
+            mr.Action("text", 0.0, value="a"),
+            mr.Action("section", 1.0),
+            mr.Action("text", 2.0, value="b"),
+        ]
+        steps = mr.ScriptWriter()._split_steps(acts)
+        self.assertEqual(len(steps), 2)
+
+    def test_consecutive_sections_no_empty(self):
+        acts = [
+            mr.Action("text", 0.0, value="a"),
+            mr.Action("section", 0.5),
+            mr.Action("section", 0.6),
+            mr.Action("text", 1.0, value="b"),
+        ]
+        steps = mr.ScriptWriter()._split_steps(acts)
+        self.assertEqual(len(steps), 2)
+
+    def test_trailing_section_no_empty(self):
+        acts = [mr.Action("text", 0.0, value="a"), mr.Action("section", 0.5)]
+        steps = mr.ScriptWriter()._split_steps(acts)
+        self.assertEqual(len(steps), 1)
+
+    def test_multi_step_script_has_step_funcs(self):
+        acts = [mr.Action("text", 0.0, value="hi"),
+                mr.Action("section", 1.0),
+                mr.Action("key", 2.0, value="enter")]
+        script = build_script(acts)
+        self.assertIn("def step_1", script)
+        self.assertIn("def step_2", script)
+        self.assertIn("step_1()", script)
+        self.assertIn("step_2()", script)
+
+
+class TestCleanScript(unittest.TestCase):
+
+    def test_no_helpers_in_clean_script(self):
+        acts = [mr.Action("text", 0.0, value="hello")]
+        script = build_script(acts)
+        self.assertNotIn("find_image", script)
+        self.assertNotIn("from pathlib import Path", script)
+
+    def test_helpers_present_for_image_click(self):
+        acts = [mr.Action("image_click", 0.0, x=100, y=100, image="click_1.png")]
+        script = build_script(acts)
+        self.assertIn("def find_image", script)
+        self.assertIn("from pathlib import Path", script)
+
+    def test_helpers_present_for_wait_image(self):
+        acts = [mr.Action("wait_image", 0.0, image="wait_1.png")]
+        script = build_script(acts)
+        self.assertIn("def wait_for_image", script)
+
+
+class TestPauseGeneration(unittest.TestCase):
+
+    def test_small_gap_no_sleep(self):
+        """Gap 0.2 s < MIN_WAIT 0.3 s -> no sleep."""
+        a = mr.Action("text", 0.2, value="x")
+        self.assertIsNone(mr.ScriptWriter()._pause(a, 0.0))
+
+    def test_large_gap_produces_sleep(self):
+        """Gap 1.5 s -> time.sleep(1.5 / SPEED)."""
+        a = mr.Action("text", 1.5, value="x")
+        line = mr.ScriptWriter()._pause(a, 0.0)
+        self.assertIsNotNone(line)
+        self.assertIn("time.sleep", line)
+        self.assertIn("/ SPEED", line)
+
+    def test_before_wait_image_no_sleep(self):
+        """No sleep before wait_image (it waits by itself)."""
+        a = mr.Action("wait_image", 2.0, image="w.png")
+        self.assertIsNone(mr.ScriptWriter()._pause(a, 0.0))
+
+    def test_after_wait_image_sleep_is_kept(self):
+        """The gap AFTER a wait_image is the user's reaction time once the picture
+        appeared, so the replay keeps it (this reverses Antigravity's FIX B11)."""
+        a = mr.Action("text", 3.0, value="x")
+        self.assertEqual(mr.ScriptWriter()._pause(a, 0.0), "time.sleep(3.0 / SPEED)")
+
+    def test_step_body_sleeps_after_wait_image_but_not_before(self):
+        acts = [
+            mr.Action("click", 0.0, x=1, y=1, value="left"),
+            mr.Action("wait_image", 6.0, image="w.png"),   # 6 s of loading: replaced by the wait
+            mr.Action("text", 8.0, value="hello"),         # 2 s reaction time: kept
+        ]
+        body = mr.ScriptWriter()._step_body(acts)
+        sleeps = [l for l in body if "time.sleep" in l]
+        self.assertEqual(sleeps, ["time.sleep(2.0 / SPEED)"], body)
+
+
+class TestExecutedScript(unittest.TestCase):
+
+    def test_click_executes(self):
+        calls = exec_script_get_calls([mr.Action("click", 0.0, x=100, y=200, value="left")])
+        self.assertIn("click", [c[0] for c in calls])
+
+    def test_hotkey_executes(self):
+        calls = exec_script_get_calls([mr.Action("hotkey", 0.0, keys=("ctrl", "c"))])
+        self.assertIn("hotkey", [c[0] for c in calls])
+
+    def test_write_executes(self):
+        calls = exec_script_get_calls([mr.Action("text", 0.0, value="hello")])
+        self.assertIn("write", [c[0] for c in calls])
+
+    def test_drag_moveto_before_dragto(self):
+        calls = exec_script_get_calls([mr.Action("drag", 0.0, x=10, y=10,
+                                                  x2=100, y2=100, value="left", end_time=0.5)])
+        names = [c[0] for c in calls]
+        self.assertLess(names.index("moveTo"), names.index("dragTo"))
+
+    def test_ctrl_click_keydown_before_keyup(self):
+        calls = exec_script_get_calls([mr.Action("click", 0.0, x=100, y=100,
+                                                  value="left", mods=("ctrl",))])
+        names = [c[0] for c in calls]
+        self.assertLess(names.index("keyDown"), names.index("keyUp"))
+
+    def test_image_click_fallback(self):
+        """click_image falls back to recorded coords (842, 517) when find_image returns None."""
+        acts = [mr.Action("image_click", 0.0, x=842, y=517, value="left",
+                           image="click_1.png", img_dx=5, img_dy=-3)]
+        script = build_script(acts)
+        ns = {
+            "time": MagicMock(),
+            "__file__": str(WORKSPACE / "dummy.py"),
+            "Path": Path,
+        }
+        ns["time"].sleep = MagicMock()
+        ns["time"].time = MagicMock(return_value=0)
+        exec(compile_script(script), ns)
+        ns["find_image"] = lambda name, timeout: None
+        clicks = []
+        ns["pyautogui"] = MagicMock()
+        ns["pyautogui"].click = MagicMock(side_effect=lambda *a, **kw: clicks.append(a))
+        ns["click_image"]("click_1.png", 5, -3, 842, 517)
+        self.assertEqual(clicks[0], (842, 517))
+
+    def test_wait_for_image_raises_on_timeout(self):
+        """wait_for_image raises SystemExit when find_image returns None."""
+        acts = [mr.Action("wait_image", 0.0, image="wait_1.png")]
+        script = build_script(acts)
+        ns = {
+            "time": MagicMock(),
+            "__file__": str(WORKSPACE / "dummy.py"),
+            "Path": Path,
+        }
+        ns["time"].sleep = MagicMock()
+        exec(compile_script(script), ns)
+        ns["find_image"] = lambda name, timeout: None
+        with self.assertRaises(SystemExit):
+            ns["wait_for_image"]("wait_1.png")
+
+
+class TestAllActionTypesCompile(unittest.TestCase):
+    """Every action kind must produce syntactically valid Python."""
+
+    def _ok(self, action):
+        compile_script(build_script([action]))
+
+    def test_click(self):
+        self._ok(mr.Action("click", 0, x=1, y=2, value="left"))
+
+    def test_right_click(self):
+        self._ok(mr.Action("click", 0, x=1, y=2, value="right"))
+
+    def test_ctrl_click(self):
+        self._ok(mr.Action("click", 0, x=1, y=2, value="left", mods=("ctrl",)))
+
+    def test_shift_drag(self):
+        self._ok(mr.Action("drag", 0, x=0, y=0, x2=100, y2=100,
+                            value="left", mods=("shift",), end_time=0.5))
+
+    def test_scroll(self):
+        self._ok(mr.Action("scroll", 0, x=1, y=1, amount=-3))
+
+    def test_hscroll(self):
+        self._ok(mr.Action("hscroll", 0, x=1, y=1, amount=2))
+
+    def test_text(self):
+        self._ok(mr.Action("text", 0, value="hello world"))
+
+    def test_text_with_quotes(self):
+        self._ok(mr.Action("text", 0, value='say hi and bye'))
+
+    def test_key(self):
+        self._ok(mr.Action("key", 0, value="enter"))
+
+    def test_hotkey(self):
+        self._ok(mr.Action("hotkey", 0, keys=("ctrl", "c")))
+
+    def test_image_click(self):
+        self._ok(mr.Action("image_click", 0, x=500, y=300, value="left",
+                            image="click_1.png", img_dx=5, img_dy=-3))
+
+    def test_wait_image(self):
+        self._ok(mr.Action("wait_image", 0, image="wait_1.png"))
+
+    def test_multi_step(self):
+        compile_script(build_script([
+            mr.Action("text", 0, value="a"),
+            mr.Action("section", 1),
+            mr.Action("text", 2, value="b"),
+        ]))
+
+    def test_empty_recording(self):
+        """Empty actions list -> run_macro containing "pass", still valid."""
+        compile_script(build_script([]))
+
+
+class TestModifierState(unittest.TestCase):
+
+    def test_release_clears_modifier(self):
+        r = FakeRecorder()
+        r.press(make_key(name="ctrl_l"))
+        self.assertIn("ctrl", r.held)
+        r.release(make_key(name="ctrl_l"))
+        self.assertNotIn("ctrl", r.held)
+
+    def test_reconcile_drops_stale(self):
+        """FIX B3: reconcile removes modifiers not physically held."""
+        r = FakeRecorder()
+        r.held = {"ctrl", "alt"}
+        real_held = {"ctrl"}
+        def fake_reconcile():
+            r.held &= real_held
+        r._reconcile_mods = fake_reconcile
+        r._reconcile_mods()
+        self.assertEqual(r.held, {"ctrl"})
+
+    def test_reconcile_called_on_mouse_press(self):
+        """_reconcile_mods is called on every mouse button press."""
+        r = FakeRecorder()
+        called = []
+        r._reconcile_mods = lambda: called.append(True)
+        r.click(100, 100, pressed=True)
+        self.assertTrue(len(called) >= 1)
+
+
+class TestCallbackExceptionSafety(unittest.TestCase):
+
+    def test_on_press_exception_is_caught(self):
+        """FIX B2: exception in _on_press must not propagate out."""
+        r = FakeRecorder()
+        r._add_hotkey = MagicMock(side_effect=RuntimeError("boom"))
+        r.press(make_key(name="ctrl_l"))
+        try:
+            r.press(make_key(char=""))  # Ctrl+A triggers _add_hotkey
+        except Exception as e:
+            self.fail(f"exception escaped _on_press: {e}")
+
+    def test_on_click_exception_is_caught(self):
+        """FIX B12: exception in _on_click must not propagate out."""
+        r = FakeRecorder()
+        r.actions = MagicMock(side_effect=RuntimeError("broken list"))
+        try:
+            r.click(100, 100, pressed=False)
+        except Exception as e:
+            self.fail(f"exception escaped _on_click: {e}")
+
+    def test_on_scroll_exception_is_caught(self):
+        """FIX B12: exception in _on_scroll must not propagate out."""
+        r = FakeRecorder()
+        r.actions = MagicMock(side_effect=RuntimeError("broken"))
+        try:
+            r.scroll(100, 100, 0, -1)
+        except Exception as e:
+            self.fail(f"exception escaped _on_scroll: {e}")
+
+
+class TestSortingByTime(unittest.TestCase):
+
+    def test_drag_sorted_before_later_text(self):
+        """
+        Drag starts at t=0 but is inserted at t=0.5 (release).
+        After sort, drag comes before text at t=0.1.
+        """
+        drag = mr.Action("drag", 0.0, x=0, y=0, x2=100, y2=100,
+                          value="left", end_time=0.5)
+        text = mr.Action("text", 0.1, value="a")
+        # Build sorted merged list the same way build() does
+        merged = mr.ScriptWriter()._merge(sorted([text, drag], key=lambda a: a.time))
+        self.assertEqual(merged[0].kind, "drag")
+        self.assertEqual(merged[1].kind, "text")
+
+
+class TestKeyNameMapping(unittest.TestCase):
+
+    def test_page_up_mapped_to_pageup(self):
+        r = FakeRecorder()
+        r.press(make_key(name="page_up"))
+        self.assertEqual(r.actions[0].value, "pageup")
+
+    def test_page_down_mapped(self):
+        r = FakeRecorder()
+        r.press(make_key(name="page_down"))
+        self.assertEqual(r.actions[0].value, "pagedown")
+
+    def test_unknown_key_passes_through(self):
+        r = FakeRecorder()
+        r.press(make_key(name="home"))
+        self.assertEqual(r.actions[0].value, "home")
+
+
+class RealModsRecorder(mr.Recorder):
+    """Recorder whose _reconcile_mods is the REAL one, with the Windows key state faked.
+    `physically_down` is the set of modifiers the keyboard really has held right now."""
+    def __init__(self, physically_down=()):
+        super().__init__()
+        self.physically_down = set(physically_down)
+
+    def _reconcile_mods(self):
+        stale = self.held - self.physically_down
+        if stale:
+            print(f"  [recorder] Cleared stale modifiers: {stale}")
+        self.held &= self.physically_down
+
+
+class TestStaleModifiersWhileTyping(unittest.TestCase):
+
+    def test_stuck_ctrl_does_not_turn_typing_into_hotkeys(self):
+        """Ctrl went down, then Ctrl+Tab (or Win+L) hid its release. Ctrl is not really
+        held any more, so typing 'a' must be text, not hotkey('ctrl', 'a')."""
+        r = RealModsRecorder(physically_down=())
+        r.held = {"ctrl"}
+        r._on_press(make_key(char="a"))
+        self.assertEqual([(a.kind, a.value) for a in r.actions], [("text", "a")])
+        self.assertEqual(r.held, set())
+
+    def test_really_held_ctrl_still_makes_a_hotkey(self):
+        r = RealModsRecorder(physically_down={"ctrl"})
+        r._on_press(make_key(name="ctrl_l"))
+        r._on_press(make_key(char="\x03"))               # Ctrl+C
+        self.assertEqual(r.actions[0].kind, "hotkey")
+        self.assertEqual(r.actions[0].keys, ("ctrl", "c"))
+
+    def test_reconcile_runs_for_special_keys_too(self):
+        r = RealModsRecorder(physically_down=())
+        r.held = {"alt"}
+        r._on_press(make_key(name="enter"))
+        self.assertEqual(r.actions[0].kind, "key")       # plain Enter, not alt+enter
+
+
+class TestMarkerThenImmediateClick(unittest.TestCase):
+    """F8 followed straight away by a click must always pair up (the screenshot is
+    taken on the keyboard thread, so the picture exists before the click arrives)."""
+
+    def setUp(self):
+        self.r = FakeRecorder()
+        self.r._mouse.position = (842, 517)
+        self.r._save_picture = MagicMock(return_value=("click_1.png", 842, 517))
+
+    def test_f8_then_instant_click_becomes_image_click(self):
+        self.r._on_press(_FakeKeyEnum.f8)
+        self.r.click(850, 520, pressed=True)
+        self.r.click(850, 520, pressed=False)
+        a = self.r.actions[0]
+        self.assertEqual((a.kind, a.image, a.img_dx, a.img_dy), ("image_click", "click_1.png", 8, 3))
+
+    def test_f8_picture_is_saved_before_f8_handler_returns(self):
+        self.r._on_press(_FakeKeyEnum.f8)
+        self.r._save_picture.assert_called_once_with("click")
+        self.assertIsNotNone(self.r._pending_image)
+
+    def test_shift_f8_adds_wait_image_through_the_real_handler(self):
+        self.r._save_picture = MagicMock(return_value=("wait_1.png", 300, 300))
+        self.r._on_press(make_key(name="shift"))
+        self.r._on_press(_FakeKeyEnum.f8)
+        self.assertEqual([(a.kind, a.image) for a in self.r.actions], [("wait_image", "wait_1.png")])
+
+    def test_second_f8_replaces_the_first_picture(self):
+        self.r._on_press(_FakeKeyEnum.f8)
+        self.r._save_picture.return_value = ("click_2.png", 842, 517)
+        self.r._on_press(_FakeKeyEnum.f8)
+        self.assertEqual(self.r._pending_image[0], "click_2.png")
+
+
+class TestPauseResume(unittest.TestCase):
+
+    def setUp(self):
+        self.r = FakeRecorder()
+        self.shift_f9 = lambda: (self.r._on_press(make_key(name="shift")),
+                                 self.r._on_press(_FakeKeyEnum.f9),
+                                 self.r._on_release(make_key(name="shift")))
+
+    def test_shift_f9_pauses_and_nothing_is_recorded(self):
+        self.shift_f9()
+        self.assertTrue(self.r.paused)
+        self.r._on_press(make_key(char="p"))
+        self.r.click(10, 10, pressed=True)
+        self.r.click(10, 10, pressed=False)
+        self.r.scroll(10, 10, 0, -1)
+        self.assertEqual(self.r.actions, [])
+
+    def test_shift_f9_again_resumes(self):
+        self.shift_f9()
+        self.shift_f9()
+        self.assertFalse(self.r.paused)
+        self.r._on_press(make_key(char="o"))
+        self.assertEqual(self.r.actions[0].value, "o")
+
+    def test_shift_f9_is_not_recorded_and_does_not_stop(self):
+        self.assertIsNone(self.r._on_press(make_key(name="shift")))
+        self.assertIsNone(self.r._on_press(_FakeKeyEnum.f9))   # None = keep listening
+
+    def test_plain_f9_still_stops_even_while_paused(self):
+        self.shift_f9()
+        self.assertIs(self.r._on_press(_FakeKeyEnum.f9), False)
+
+    def test_modifiers_are_still_tracked_while_paused(self):
+        self.shift_f9()
+        self.r._on_press(make_key(name="ctrl_l"))
+        self.assertIn("ctrl", self.r.held)
+        self.r._on_release(make_key(name="ctrl_l"))
+        self.assertNotIn("ctrl", self.r.held)
+
+    def test_paused_time_is_not_counted_as_waiting(self):
+        """Typed at t=100, paused for 50 s, typed again: the two Actions are ~0 s apart,
+        not 50 s, so the script gets no long time.sleep()."""
+        clock = [100.0]
+        real_time = mr.time.time
+        mr.time.time = lambda: clock[0]
+        try:
+            self.r._on_press(make_key(char="a"))
+            clock[0] = 101.0
+            self.shift_f9()                      # pause at t=101
+            clock[0] = 151.0
+            self.shift_f9()                      # resume at t=151 (50 s paused)
+            clock[0] = 151.5
+            self.r._on_press(make_key(char="b"))
+        finally:
+            mr.time.time = real_time
+        a, b = self.r.actions
+        self.assertAlmostEqual(b.time - a.time, 1.5)    # 151.5 - 50 - 100
+        script = build_script(self.r.actions)
+        self.assertNotIn("time.sleep(50", script)
+
+    def test_pausing_forgets_an_unused_f8_picture(self):
+        self.r._pending_image = ("click_1.png", 1, 1)
+        self.shift_f9()
+        self.assertIsNone(self.r._pending_image)
+
+
+class TestRecordingFile(unittest.TestCase):
+    """The .jsonl recording: written as it happens, readable later."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.meta = {"version": mr.LOG_VERSION, "session": "macro_test",
+                     "created": "2026-10-10T11:00:00", "screen": [1920, 1080]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _sample_actions(self):
+        return [
+            mr.Action("click", 1000.0, x=842, y=517, value="left", mods=("ctrl",)),
+            mr.Action("text", 1001.0, value="hi"),
+            mr.Action("hotkey", 1002.0, keys=("ctrl", "c")),
+            mr.Action("drag", 1003.0, x=1, y=2, x2=3, y2=4, value="left", end_time=1003.6),
+            mr.Action("scroll", 1004.0, x=5, y=6, amount=-3),
+            mr.Action("image_click", 1005.0, x=9, y=9, value="left", image="click_1.png", img_dx=8, img_dy=3),
+            mr.Action("wait_image", 1006.0, image="wait_2.png"),
+            mr.Action("section", 1007.0),
+        ]
+
+    def test_action_round_trips_through_a_dict(self):
+        for a in self._sample_actions():
+            self.assertEqual(mr.Action.from_dict(json_roundtrip(a.to_dict())), a)
+
+    def test_log_is_written_as_each_action_is_appended(self):
+        path = self.dir / "macro_test.jsonl"
+        log = mr.ActionLog(path, self.meta)
+        log.append(mr.Action("text", 1.0, value="x"))
+        # file read BEFORE close(): the line must already be on disk
+        lines = path.read_text(encoding="utf-8").splitlines()
+        log.close()
+        self.assertEqual(len(lines), 2)
+        self.assertIn('"meta"', lines[0])
+        self.assertIn('"kind": "text"', lines[1])
+
+    def test_load_log_returns_meta_and_actions(self):
+        path = self.dir / "macro_test.jsonl"
+        log = mr.ActionLog(path, self.meta)
+        for a in self._sample_actions():
+            log.append(a)
+        log.close()
+        meta, actions = mr.load_log(path)
+        self.assertEqual(meta["screen"], [1920, 1080])
+        self.assertEqual(actions, self._sample_actions())
+
+    def test_cut_off_last_line_is_skipped_with_a_warning(self):
+        path = self.dir / "macro_test.jsonl"
+        log = mr.ActionLog(path, self.meta)
+        log.append(mr.Action("text", 1.0, value="ok"))
+        log.close()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write('{"kind": "click", "time": 2.0, "x": 8')        # the recorder died mid-write
+        meta, actions = mr.load_log(path)
+        self.assertEqual([a.value for a in actions], ["ok"])
+
+    def test_bad_line_in_the_middle_raises_with_its_line_number(self):
+        path = self.dir / "bad.jsonl"
+        path.write_text('{"meta": {"version": 1}}\n'
+                        '{"kind": "text", "time": 1, "value": "a"}\n'
+                        'this is not json\n'
+                        '{"kind": "text", "time": 2, "value": "b"}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "line 3"):
+            mr.load_log(path)
+
+    def test_unknown_kind_raises_with_its_line_number(self):
+        path = self.dir / "bad.jsonl"
+        path.write_text('{"meta": {"version": 1}}\n{"kind": "explode", "time": 1}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "line 2.*unknown action kind"):
+            mr.load_log(path)
+
+    def test_missing_field_and_wrong_type_raise(self):
+        path = self.dir / "bad.jsonl"
+        path.write_text('{"meta": {"version": 1}}\n{"kind": "click", "x": 1}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "line 2"):
+            mr.load_log(path)
+        path.write_text('{"meta": {"version": 1}}\n{"kind": "click", "time": 1, "x": "left"}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "line 2"):
+            mr.load_log(path)
+
+    def test_wrong_version_and_missing_meta_raise(self):
+        path = self.dir / "bad.jsonl"
+        path.write_text('{"meta": {"version": 99}}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "version"):
+            mr.load_log(path)
+        path.write_text('{"kind": "text", "time": 1}\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "meta"):
+            mr.load_log(path)
+        path.write_text("", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            mr.load_log(path)
+
+    def test_blank_lines_are_ignored(self):
+        path = self.dir / "gaps.jsonl"
+        path.write_text('\n{"meta": {"version": 1}}\n\n{"kind": "key", "time": 1, "value": "enter"}\n\n',
+                        encoding="utf-8")
+        _, actions = mr.load_log(path)
+        self.assertEqual(len(actions), 1)
+
+
+def json_roundtrip(data):
+    import json
+    return json.loads(json.dumps(data))
+
+
+class TestGenerateCommand(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.meta = {"version": mr.LOG_VERSION, "session": "macro_2026-10-10_110000",
+                     "created": "2026-10-10T11:00:00", "screen": [1920, 1080]}
+        self.actions = [
+            mr.Action("click", 1000.0, x=842, y=517, value="left"),
+            mr.Action("text", 1002.0, value="hi"),
+            mr.Action("image_click", 1004.0, x=9, y=9, value="left", image="click_1.png", img_dx=8, img_dy=3),
+        ]
+        self.log = self.dir / "macro_2026-10-10_110000.jsonl"
+        log = mr.ActionLog(self.log, self.meta)
+        for a in self.actions:
+            log.append(a)
+        log.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_generate_writes_a_regen_script_next_to_the_log(self):
+        out = mr.generate(self.log)
+        self.assertEqual(out, self.dir / "macro_2026-10-10_110000_regen.py")
+        text = out.read_text(encoding="utf-8")
+        compile(text, "regen", "exec")
+        self.assertIn("pyautogui.click(842, 517)", text)
+        self.assertIn("click_image('click_1.png', 8, 3, 9, 9)", text)
+        self.assertIn("'macro_2026-10-10_110000_images'", text)    # pictures folder from the meta
+
+    def test_regenerated_script_matches_a_direct_build(self):
+        direct = mr.ScriptWriter().build(self.actions, self.meta["session"], screen=(1920, 1080))
+        regen = mr.generate(self.log).read_text(encoding="utf-8")
+        strip = lambda t: "\n".join(l for l in t.splitlines() if "Auto-generated" not in l)
+        self.assertEqual(strip(regen), strip(direct))
+
+    def test_changing_a_setting_changes_the_regenerated_script(self):
+        """The point of the recording: tweak MERGE_GAP / MIN_WAIT, regenerate, no re-recording."""
+        before = mr.generate(self.log).read_text(encoding="utf-8")
+        self.assertIn("time.sleep(2.0 / SPEED)", before)          # the 2 s gaps are kept by default
+        old = mr.MIN_WAIT
+        try:
+            mr.MIN_WAIT = 5.0
+            after = mr.generate(self.log).read_text(encoding="utf-8")
+        finally:
+            mr.MIN_WAIT = old
+        self.assertNotIn("time.sleep(2.0 / SPEED)", after)        # now gaps under 5 s are dropped
+
+    def test_cli_generate_reports_bad_files_without_a_traceback(self):
+        bad = self.dir / "bad.jsonl"
+        bad.write_text('{"meta": {"version": 1}}\nnot json\n{"kind": "key", "time": 1, "value": "a"}\n',
+                       encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            mr.main(["generate", str(bad)])
+        self.assertIn("line 2", str(ctx.exception))
+
+    def test_cli_generate_runs(self):
+        mr.main(["generate", str(self.log)])
+        self.assertTrue((self.dir / "macro_2026-10-10_110000_regen.py").exists())
+
+
+class TestGeneratedCodeIsSafe(unittest.TestCase):
+
+    def test_quotes_in_names_cannot_break_out_of_the_string(self):
+        """A hand-edited recording with code hidden in a name must stay a plain string."""
+        import ast
+        evil = 'x"); import os; os.system("boom'
+        acts = [mr.Action("image_click", 1.0, x=1, y=1, value="left", image=evil),
+                mr.Action("wait_image", 2.0, image=evil),
+                mr.Action("key", 3.0, value=evil),
+                mr.Action("click", 4.0, x=1, y=1, value=evil)]
+        tree = ast.parse(mr.ScriptWriter().build(acts, "macro_x"))      # must still be valid Python
+        imported = {alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names}
+        imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertEqual(imported, {"time", "pyautogui", "pathlib"})    # no smuggled "import os"
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        self.assertNotIn("system", called)
+
+    def test_session_name_with_a_quote_cannot_break_the_helpers(self):
+        acts = [mr.Action("wait_image", 1.0, image="w.png")]
+        text = mr.ScriptWriter().build(acts, 'bad"; import os #')
+        compile(text, "evil", "exec")
+        self.assertNotIn('\nimport os', text)
+
+
+class TestScreenSizeCheck(unittest.TestCase):
+
+    def test_script_warns_when_screen_differs(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")],
+                                       "macro_x", screen=(1920, 1080))
+        self.assertIn("RECORDED_SCREEN = (1920, 1080)", text)
+        compile(text, "s", "exec")
+        calls, printed = [], []
+        pag = types.ModuleType("pyautogui")
+        pag.size = lambda: (1366, 768)
+        pag.FailSafeException = Exception
+        for n in ("click", "keyDown", "keyUp"):
+            setattr(pag, n, lambda *a, **k: None)
+        ns = {"__name__": "__main__", "time": MagicMock(), "pyautogui": pag, "print": printed.append}
+        old = sys.modules.get("pyautogui")
+        sys.modules["pyautogui"] = pag
+        try:
+            exec(compile(text.replace("COUNTDOWN = 3", "COUNTDOWN = 0"), "s", "exec"), ns)
+        finally:
+            sys.modules["pyautogui"] = old
+        self.assertTrue(any("WARNING" in str(p) and "(1366, 768)" in str(p) for p in printed), printed)
+
+    def test_no_screen_means_no_check(self):
+        text = mr.ScriptWriter().build([mr.Action("click", 1.0, x=1, y=1, value="left")], "macro_x")
+        self.assertNotIn("RECORDED_SCREEN", text)
+
+
+class TestBeepNeverCrashes(unittest.TestCase):
+
+    def test_beep_swallows_device_errors(self):
+        original = mr.winsound
+        broken = types.SimpleNamespace(Beep=MagicMock(side_effect=RuntimeError("Failed to beep")))
+        mr.winsound = broken
+        try:
+            mr.beep(1000, 10)        # must not raise
+        finally:
+            mr.winsound = original
+
+
+class TestWholeSession(unittest.TestCase):
+    """Runs the real record() end to end with fake listeners that "perform" a scripted
+    session, then replays the saved script against a fake pyautogui."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        self.mock = mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.patches = [
+            mock.patch.object(mr, "__file__", str(self.dir / "macro_recorder.py")),
+            mock.patch.object(mr, "START_DELAY", 0),
+            mock.patch.object(mr, "BEEP", False),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _perform_session(self):
+        """Replace the pynput listeners so entering the keyboard listener "types" a session."""
+        callbacks = {}
+        clock = [5000.0]
+        key = lambda **kw: make_key(**kw)
+
+        def session():
+            kb_press, kb_release = callbacks["on_press"], callbacks["on_release"]
+            on_click, on_scroll = callbacks["on_click"], callbacks["on_scroll"]
+            btn = _FakeButtonEnum.left
+            tick = lambda dt: clock.__setitem__(0, clock[0] + dt)
+            shift_combo = lambda k: (kb_press(key(name="shift")), kb_press(k), kb_release(key(name="shift")))
+
+            tick(1); on_click(842, 517, btn, True); tick(.1); on_click(842, 517, btn, False)
+            tick(1)
+            for c in "hi":
+                kb_press(key(char=c)); tick(.1)
+            shift_combo(_FakeKeyEnum.f9)                       # pause
+            tick(40)                                           # 40 s typing a password...
+            for c in "secret":
+                kb_press(key(char=c)); tick(.1)
+            shift_combo(_FakeKeyEnum.f9)                       # resume
+            tick(1); kb_press(_FakeKeyEnum.f8)                 # picture of what is under the mouse
+            tick(.3); on_click(510, 410, btn, True); tick(.05); on_click(510, 410, btn, False)
+            tick(6); shift_combo(_FakeKeyEnum.f8)              # wait-for-image
+            tick(2); kb_press(key(name="ctrl_l")); kb_press(_FakeKeyEnum.f8); kb_release(key(name="ctrl_l"))
+            tick(1); kb_press(key(char="x"))
+            tick(1); kb_press(_FakeKeyEnum.f9)                 # stop
+
+        class KbListener:
+            def __init__(self, on_press=None, on_release=None):
+                callbacks.update(on_press=on_press, on_release=on_release)
+            def __enter__(self): session(); return self
+            def __exit__(self, *a): pass
+            def join(self): pass
+
+        class MouseListener:
+            def __init__(self, on_click=None, on_scroll=None):
+                callbacks.update(on_click=on_click, on_scroll=on_scroll)
+            def start(self): pass
+            def stop(self): pass
+
+        return KbListener, MouseListener, clock
+
+    def test_record_then_replay(self):
+        import io, contextlib
+        KbListener, MouseListener, clock = self._perform_session()
+
+        def fake_screenshot(region):
+            return types.SimpleNamespace(save=lambda path: Path(path).write_bytes(b"png"))
+
+        with self.mock.patch.object(_keyboard_stub, "Listener", KbListener), \
+             self.mock.patch.object(_mouse_stub, "Listener", MouseListener), \
+             self.mock.patch.object(mr.time, "time", lambda: clock[0]), \
+             self.mock.patch.object(_fake_pyautogui, "screenshot", fake_screenshot), \
+             self.mock.patch("builtins.input", return_value="n"), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            mr.record()
+
+        files = sorted(p.name for p in self.dir.iterdir())
+        jsonl = next(self.dir.glob("macro_*.jsonl"))
+        script = next(self.dir.glob("macro_*.py"))
+        images = next(self.dir.glob("macro_*_images"))
+        self.assertEqual(sorted(p.name for p in images.iterdir()), ["click_1.png", "wait_2.png"])
+
+        raw = jsonl.read_text(encoding="utf-8")
+        text = script.read_text(encoding="utf-8")
+        self.assertNotIn("secret", raw)                  # paused: the password was never recorded
+        self.assertNotIn("secret", text)
+        self.assertNotIn("time.sleep(40", text)          # and the 40 s pause is not replayed as a wait
+        self.assertIn("pyautogui.click(842, 517)", text)
+        self.assertIn("pyautogui.write('hi'", text)
+        # the F8 picture was centered on the mouse at (500, 400); the click at (510, 410) is
+        # 10 px right and 10 px below the picture's center; (510, 410) is the fallback spot
+        self.assertIn("click_image('click_1.png', 10, 10, 510, 410)", text)
+        self.assertIn("wait_for_image('wait_2.png')", text)
+        self.assertIn("def step_1():", text)
+        self.assertIn("def step_2():", text)
+        self.assertIn("RECORDED_SCREEN = (1920, 1080)", text)
+
+        # regenerating from the recording gives the same script
+        regen = mr.generate(jsonl).read_text(encoding="utf-8")
+        strip = lambda t: "\n".join(l for l in t.splitlines() if "Auto-generated" not in l)
+        self.assertEqual(strip(regen), strip(text))
+
+        # and the script really runs: every call lands in the right order
+        calls = []
+        pag = types.ModuleType("pyautogui")
+        pag.FAILSAFE, pag.PAUSE = True, 0.1
+        pag.FailSafeException = type("FSE", (Exception,), {})
+        pag.ImageNotFoundException = type("INF", (Exception,), {})
+        pag.size = lambda: (1920, 1080)
+        pag.locateCenterOnScreen = lambda path, confidence=None: types.SimpleNamespace(x=700, y=300)
+        for n in ("click", "write", "press", "hotkey", "keyDown", "keyUp", "moveTo", "dragTo"):
+            setattr(pag, n, (lambda n: lambda *a, **k: calls.append((n, a)))(n))
+        old = sys.modules["pyautogui"]
+        sys.modules["pyautogui"] = pag
+        try:
+            with self.mock.patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+                ns = {"__name__": "__main__", "__file__": str(script)}
+                exec(compile(text, str(script), "exec"), ns)
+        finally:
+            sys.modules["pyautogui"] = old
+        self.assertEqual([c[0] for c in calls], ["click", "write", "click", "write"])
+        self.assertEqual(calls[0], ("click", (842, 517)))
+        self.assertEqual(calls[2], ("click", (710, 310)))   # picture found at (700, 300) + offset (10, 10)
+        self.assertEqual(calls[-1][0], "write")             # the "x" typed in step 2
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

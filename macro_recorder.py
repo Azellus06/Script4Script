@@ -1,26 +1,37 @@
 """
-Macro Recorder - Step 4 (full version)
+Macro Recorder
 
-Run it, do your task normally, press F9 to stop.
-It saves a ready-to-run macro_YYYY-MM-DD_HHMMSS.py next to this file
-(plus a macro_..._images folder if you used picture markers),
-then asks if you want to replay it right away.
+Record:    python macro_recorder.py
+           Do your task normally, press F9 to stop.
+           It saves three things next to this file:
+             macro_<date>_<time>.jsonl      the raw recording (every action, saved as it happens)
+             macro_<date>_<time>.py         a ready-to-run script made from the recording
+             macro_<date>_<time>_images/    pictures from the F8 markers (only if you used them)
+           then asks if you want to replay the script right away.
+
+Regenerate: python macro_recorder.py generate macro_<date>_<time>.jsonl
+           Rebuilds a script from a saved recording without re-recording, for example after
+           changing MERGE_GAP or MIN_WAIT below. Writes macro_<date>_<time>_regen.py.
 
 Install once:  pip install pynput pyautogui pillow opencv-python
 
 Hotkeys while recording:
   F9         stop and save
+  Shift+F9   pause / resume - nothing is recorded while paused (use it for passwords!)
   F8         image click   - hover over a button, press F8, then click it as normal
   Shift+F8   wait for image - press it while the thing you are waiting for is on screen
   Ctrl+F8    new step       - starts a new step_N() function in the script
-"""
 
+WARNING: everything you type is saved as plain text in the .jsonl and .py files.
+"""
+import argparse
 import ctypes
+import json
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -64,6 +75,18 @@ MODIFIER_NAMES = {
 }
 MODIFIER_ORDER = ("ctrl", "shift", "alt", "win")  # order used inside hotkey(...)
 
+# Virtual-key codes used by _reconcile_mods() to detect stale modifier state.
+# FIX B3: GetAsyncKeyState returns 0x8000 when the physical key is held down.
+_VK_MOD_MAP = {
+    0xA2: "ctrl",   # VK_LCONTROL
+    0xA3: "ctrl",   # VK_RCONTROL
+    0xA0: "shift",  # VK_LSHIFT
+    0xA1: "shift",  # VK_RSHIFT
+    0x12: "alt",    # VK_MENU (both sides)
+    0x5B: "win",    # VK_LWIN
+    0x5C: "win",    # VK_RWIN
+}
+
 # pynput key name -> pyautogui key name (only where they differ)
 KEY_NAMES = {
     "page_up": "pageup",
@@ -81,6 +104,7 @@ LABELS = {
     "scroll": "scroll", "hscroll": "sideways scroll", "wait_image": "wait for image",
     "text": "typed text", "key": "key press", "hotkey": "shortcut",
 }
+KINDS = set(LABELS) | {"section"}   # every kind an Action can have (a recording is checked against this)
 
 # Code pasted into generated scripts that use pictures. __FOLDER__ is replaced
 # with the name of the picture folder.
@@ -130,7 +154,10 @@ def wait_for_image(name):
 def beep(freq, ms):
     """Short beep so you know something registered (skipped if BEEP is off)."""
     if BEEP and winsound:
-        winsound.Beep(freq, ms)
+        try:
+            winsound.Beep(freq, ms)
+        except Exception:
+            pass   # no sound device: a missing beep must never crash a recording
 
 
 def beep_async(freq, ms):
@@ -161,6 +188,95 @@ class Action:
         if not self.end_time:
             self.end_time = self.time
 
+    def to_dict(self):
+        """Plain dict for the .jsonl recording (tuples become lists)."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data):
+        """Rebuild an Action from one recording line. Raises ValueError if it is malformed."""
+        if not isinstance(data, dict) or "kind" not in data or "time" not in data:
+            raise ValueError("an action needs at least 'kind' and 'time'")
+        if not isinstance(data["kind"], str) or data["kind"] not in KINDS:
+            raise ValueError(f"unknown action kind {data['kind']!r}")
+        values = {k: v for k, v in data.items() if k in {f.name for f in fields(cls)}}
+        try:
+            for name in ("time", "end_time"):
+                if name in values:
+                    values[name] = float(values[name])
+            for name in ("x", "y", "x2", "y2", "amount", "img_dx", "img_dy"):
+                if name in values:
+                    values[name] = int(values[name])
+            for name in ("keys", "mods"):
+                if name in values:
+                    values[name] = tuple(str(k) for k in values[name])
+            for name in ("value", "image"):
+                if name in values:
+                    values[name] = str(values[name])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"bad field value ({error})") from error
+        return cls(**values)
+
+
+LOG_VERSION = 1   # bump this if the .jsonl layout ever changes
+
+
+class ActionLog(list):
+    """A list of Actions that also writes every new one to a .jsonl file straight away,
+    so a crash or power cut loses nothing that was already recorded.
+    Line 1 is a "meta" header; every other line is one action."""
+
+    def __init__(self, path, meta):
+        super().__init__()
+        self._lock = threading.Lock()   # the mouse and keyboard threads both append
+        self._file = open(path, "w", encoding="utf-8")
+        self._write({"meta": meta})
+
+    def _write(self, record):
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()              # flush now, not at exit, so a crash loses nothing
+
+    def append(self, action):
+        with self._lock:
+            super().append(action)
+            self._write(action.to_dict())
+
+    def close(self):
+        with self._lock:
+            self._file.close()
+
+
+def load_log(path):
+    """Read a .jsonl recording. Returns (meta dict, list of Actions).
+    A cut-off last line (the recorder died mid-write) is skipped with a warning.
+    Any other bad line raises ValueError that names the line number."""
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    last = max((i for i, text in enumerate(lines) if text.strip()), default=-1)
+    meta, actions = None, []
+    for i, text in enumerate(lines):
+        if not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "meta" in data:
+                meta = data["meta"]
+                if not isinstance(meta, dict) or meta.get("version") != LOG_VERSION:
+                    raise ValueError(f"unsupported log version (this program reads version {LOG_VERSION})")
+            elif meta is None:
+                raise ValueError("the first line must be the 'meta' header (is this a macro recording?)")
+            else:
+                actions.append(Action.from_dict(data))
+        except json.JSONDecodeError as error:
+            if i == last and meta is not None:
+                print(f"Warning: line {i + 1} is cut off (the recording was probably interrupted). Ignoring it.")
+                break
+            raise ValueError(f"line {i + 1}: not valid JSON ({error})") from error
+        except ValueError as error:
+            raise ValueError(f"line {i + 1}: {error}") from error
+    if meta is None:
+        raise ValueError("the file is empty or has no 'meta' header")
+    return meta, actions
+
 
 class Recorder:
     """Listens to the mouse and keyboard and collects Action objects."""
@@ -169,20 +285,65 @@ class Recorder:
         self.actions = []
         self.held = set()    # modifiers currently held down, e.g. {"ctrl"}
         self._press = None   # (x, y, time, mods) of the mouse button that is currently down
-        # The script and its picture folder share this name, e.g. macro_2026-09-28_143005
+        # The script, recording and picture folder share this name, e.g. macro_2026-09-28_143005
         self.session = datetime.now().strftime("macro_%Y-%m-%d_%H%M%S")
         self.image_dir = Path(__file__).parent / f"{self.session}_images"
+        self.log_path = Path(__file__).parent / f"{self.session}.jsonl"
         self._mouse = mouse.Controller()   # lets us read the mouse position on F8
         self._marker_count = 0             # numbers the pictures: click_1.png, wait_2.png...
         self._pending_image = None         # (file, center_x, center_y) waiting for your next click
+        # The mouse thread reads _pending_image while the keyboard thread sets it
+        self._marker_lock = threading.Lock()
+        self.paused = False                # Shift+F9 toggles this
+        self._paused_at = 0.0              # when the current pause began
+        self._pause_offset = 0.0           # total seconds spent paused so far
+
+    def _now(self):
+        """Current time minus the time spent paused, so a pause never becomes a long sleep()."""
+        return time.time() - self._pause_offset
+
+    def _toggle_pause(self):
+        """Shift+F9: stop or start recording without ending the session."""
+        if self.paused:
+            self._pause_offset += time.time() - self._paused_at
+            self.paused = False
+            print("  RESUMED - recording again.")
+            beep_async(900, 150)
+        else:
+            self._paused_at = time.time()
+            self.paused = True
+            self._press = None                  # forget a half-finished click
+            with self._marker_lock:
+                self._pending_image = None      # and an unused F8 picture
+            print("  PAUSED - nothing is recorded until you press Shift+F9 again.")
+            beep_async(500, 150)
 
     def _current_mods(self):
         """Modifiers held right now in a fixed order, e.g. ('ctrl', 'shift')."""
         return tuple(m for m in MODIFIER_ORDER if m in self.held)
 
+    def _reconcile_mods(self):
+        """FIX B3: Drop modifiers from self.held that are NOT physically pressed.
+        Called on every mouse press and every non-modifier key press, to clear phantom
+        modifiers left behind by Alt+Tab, Win+L, etc. (Windows only)."""
+        if sys.platform != "win32":
+            return
+        try:
+            gaks = ctypes.windll.user32.GetAsyncKeyState
+            real = {mod for vk, mod in _VK_MOD_MAP.items() if gaks(vk) & 0x8000}
+            stale = self.held - real
+            if stale:
+                print(f"  [recorder] Cleared stale modifiers: {stale}")
+            self.held &= real
+        except Exception as exc:
+            print(f"  [recorder] _reconcile_mods failed: {exc}")
+
     # ----- markers (F8 family) -----
     def _save_picture(self, purpose):
-        """Screenshot the area around the mouse. Returns (file, center_x, center_y) or None."""
+        """Screenshot the area around the mouse. Returns (file, center_x, center_y) or None.
+        Runs right on the keyboard thread on purpose: a small screenshot takes well under
+        100 ms, and doing it in the background lets your very next click arrive before the
+        picture exists, so the click and the picture would not get paired up."""
         x, y = self._mouse.position
         screen_w, screen_h = pyautogui.size()
         # Center the picture on the mouse, but keep it fully on screen near the edges
@@ -203,62 +364,82 @@ class Recorder:
         """F8: save a picture; your next click on it becomes an image click."""
         saved = self._save_picture("click")
         if saved:
-            self._pending_image = saved
+            with self._marker_lock:
+                # FIX B6: warn if a previous F8 picture was never clicked
+                if self._pending_image is not None:
+                    print("  Warning: the previous F8 picture was never clicked and is now replaced.")
+                self._pending_image = saved
             print(f"  F8: saved {saved[0]} - now click it.")
             beep_async(800, 100)
 
     def _marker_wait(self):
         """Shift+F8: save a picture and make the script wait until it appears."""
+        now = self._now()
         saved = self._save_picture("wait")
         if saved:
-            self.actions.append(Action("wait_image", time.time(), image=saved[0]))
+            self.actions.append(Action("wait_image", now, image=saved[0]))
             print(f"  Shift+F8: saved {saved[0]} - the script will wait for it.")
             beep_async(1200, 100)
 
     def _marker_section(self):
         """Ctrl+F8: everything from here on goes into the next step_N() function."""
-        self.actions.append(Action("section", time.time()))
+        self.actions.append(Action("section", self._now()))
         print("  Ctrl+F8: new step started.")
         beep_async(600, 100)
 
     # ----- mouse -----
     def _on_click(self, x, y, button, pressed):
-        if pressed:
-            self._press = (x, y, time.time(), self._current_mods())  # remember the press
-            return
-        if self._press is None:
-            return
-        px, py, t0, mods = self._press
-        self._press = None
-        pending, self._pending_image = self._pending_image, None   # a marker is used once
+        try:
+            if self.paused:
+                return                # Shift+F9 pause: nothing is recorded
+            if pressed:
+                # FIX B3: reconcile modifier state on every mouse press
+                self._reconcile_mods()
+                self._press = (x, y, self._now(), self._current_mods())
+                return
+            if self._press is None:
+                return
+            px, py, t0, mods = self._press
+            self._press = None
+            # FIX B9: consume pending image atomically (screenshot thread may write it)
+            with self._marker_lock:
+                pending, self._pending_image = self._pending_image, None
 
-        if max(abs(x - px), abs(y - py)) >= DRAG_MIN_PIXELS:
-            # Moved a lot = a drag from the press point to the release point
+            if max(abs(x - px), abs(y - py)) >= DRAG_MIN_PIXELS:
+                # Moved a lot = a drag from the press point to the release point
+                if pending:
+                    print("  The picture from F8 was not used (you dragged instead of clicking).")
+                self.actions.append(Action("drag", t0, x=px, y=py, x2=x, y2=y,
+                                           value=button.name, mods=mods, end_time=self._now()))
+                return
+
+            # Barely moved = a normal click (recorded at the press position)
+            action = Action("click", t0, x=px, y=py, value=button.name, mods=mods)
             if pending:
-                print("  The picture from F8 was not used (you dragged instead of clicking).")
-            self.actions.append(Action("drag", t0, x=px, y=py, x2=x, y2=y,
-                                       value=button.name, mods=mods, end_time=time.time()))
-            return
-
-        # Barely moved = a normal click (recorded at the press position)
-        action = Action("click", t0, x=px, y=py, value=button.name, mods=mods)
-        if pending:
-            name, cx, cy = pending
-            if abs(px - cx) <= IMAGE_W // 2 and abs(py - cy) <= IMAGE_H // 2:
-                # Click landed inside the picture: turn it into an image click
-                action = replace(action, kind="image_click", image=name,
-                                 img_dx=px - cx, img_dy=py - cy)
-            else:
-                print("  Your click was outside the F8 picture, so it stays a normal click.")
-        self.actions.append(action)
+                name, cx, cy = pending
+                if abs(px - cx) <= IMAGE_W // 2 and abs(py - cy) <= IMAGE_H // 2:
+                    # Click landed inside the picture: turn it into an image click
+                    action = replace(action, kind="image_click", image=name,
+                                     img_dx=px - cx, img_dy=py - cy)
+                else:
+                    print("  Your click was outside the F8 picture, so it stays a normal click.")
+            self.actions.append(action)
+        except Exception as exc:
+            # FIX B2/B12: surface errors; a bare raise would silently kill the listener
+            print(f"  [recorder] _on_click error: {exc}")
 
     def _on_scroll(self, x, y, dx, dy):
-        # dy: +1 = one notch up, -1 = down.  dx: +1 = one notch right, -1 = left.
-        now, mods = time.time(), self._current_mods()
-        if dy:
-            self.actions.append(Action("scroll", now, x=x, y=y, amount=int(dy), mods=mods))
-        if dx:
-            self.actions.append(Action("hscroll", now, x=x, y=y, amount=int(dx), mods=mods))
+        try:
+            if self.paused:
+                return
+            # dy: +1 = one notch up, -1 = down.  dx: +1 = one notch right, -1 = left.
+            now, mods = self._now(), self._current_mods()
+            if dy:
+                self.actions.append(Action("scroll", now, x=x, y=y, amount=int(dy), mods=mods))
+            if dx:
+                self.actions.append(Action("hscroll", now, x=x, y=y, amount=int(dx), mods=mods))
+        except Exception as exc:
+            print(f"  [recorder] _on_scroll error: {exc}")
 
     # ----- keyboard -----
     @staticmethod
@@ -276,76 +457,126 @@ class Recorder:
         self.actions.append(Action("hotkey", now, keys=keys))
 
     def _on_press(self, key):
-        if key == KEY_STOP:
-            return False          # returning False stops the keyboard listener
-        if key == KEY_MARKER:     # the modifiers tell us which marker it is
-            if "shift" in self.held:
-                self._marker_wait()
-            elif "ctrl" in self.held:
-                self._marker_section()
+        try:
+            name = getattr(key, "name", None)
+
+            # A modifier going down: remember it, but don't record it by itself
+            if name in MODIFIER_NAMES:
+                self.held.add(MODIFIER_NAMES[name])
+                return
+
+            # Any other key: first forget modifiers that are not really held down any more
+            self._reconcile_mods()
+
+            if key == KEY_STOP:
+                if "shift" in self.held:      # Shift+F9 = pause / resume
+                    self._toggle_pause()
+                    return
+                return False          # returning False stops the keyboard listener
+            if self.paused:
+                return                # nothing is recorded while paused
+            if key == KEY_MARKER:     # the modifiers tell us which marker it is
+                if "shift" in self.held:
+                    self._marker_wait()
+                elif "ctrl" in self.held:
+                    self._marker_section()
+                else:
+                    self._marker_image_click()
+                return
+
+            now = self._now()
+
+            # FIX B4/B21: AltGr on Windows synthesises Ctrl_L + Alt_R key-downs,
+            # so self.held already has {"ctrl", "alt"} when the AltGr keycode fires.
+            # Drop alt_gr itself; the real character (e.g. '€') arrives as a separate
+            # KeyCode event handled below.
+            if name == "alt_gr":
+                return
+
+            # Shift alone is not a "combo" for letters (Shift+a already arrives as "A")
+            combo = self.held & {"ctrl", "alt", "win"}
+            char = getattr(key, "char", None)
+
+            # Normal letters, digits, symbols
+            if char is not None:
+                # FIX B21: AltGr characters (e.g. '€' on EU keyboards) arrive with
+                # combo == {"ctrl", "alt"} due to the synthetic keys above.
+                # Treat them as plain text, not as Ctrl+Alt hotkeys.
+                if combo == {"ctrl", "alt"} and char.isprintable() and ord(char) > 127:
+                    self.actions.append(Action("text", now, value=char))
+                    return
+                if combo:
+                    key_name = self._char_to_key(char)
+                    if key_name:
+                        self._add_hotkey(now, key_name)
+                elif char.isprintable():
+                    self.actions.append(Action("text", now, value=char))
+                return
+
+            # Space is text so words merge (but Ctrl+Space is a combo)
+            if key == keyboard.Key.space and not combo:
+                self.actions.append(Action("text", now, value=" "))
+                return
+
+            # Special keys: enter, tab, backspace, arrows, F1-F12...
+            if name is None:
+                # Keys with no .char and no .name (rare hardware-specific keys): skip silently.
+                return
+            key_name = KEY_NAMES.get(name, name)
+            if self.held:                              # e.g. Shift+Tab, Alt+Tab
+                self._add_hotkey(now, key_name)
             else:
-                self._marker_image_click()
-            return
-
-        now = time.time()
-        name = getattr(key, "name", None)
-
-        # A modifier going down: remember it, but don't record it by itself
-        if name in MODIFIER_NAMES:
-            self.held.add(MODIFIER_NAMES[name])
-            return
-        if name == "alt_gr":
-            return
-
-        # Shift alone is not a "combo" for letters (Shift+a already arrives as "A")
-        combo = self.held & {"ctrl", "alt", "win"}
-        char = getattr(key, "char", None)
-
-        # Normal letters, digits, symbols
-        if char is not None:
-            if combo:
-                key_name = self._char_to_key(char)
-                if key_name:
-                    self._add_hotkey(now, key_name)
-            elif char.isprintable():
-                self.actions.append(Action("text", now, value=char))
-            return
-
-        # Space is text so words merge (but Ctrl+Space is a combo)
-        if key == keyboard.Key.space and not combo:
-            self.actions.append(Action("text", now, value=" "))
-            return
-
-        # Special keys: enter, tab, backspace, arrows, F1-F12...
-        if name is None:
-            return
-        key_name = KEY_NAMES.get(name, name)
-        if self.held:                              # e.g. Shift+Tab, Alt+Tab
-            self._add_hotkey(now, key_name)
-        else:
-            self.actions.append(Action("key", now, value=key_name))
+                self.actions.append(Action("key", now, value=key_name))
+        except Exception as exc:
+            # FIX B2/B12: never let an exception escape a pynput callback silently
+            print(f"  [recorder] _on_press error: {exc}")
 
     def _on_release(self, key):
-        name = getattr(key, "name", None)
-        if name in MODIFIER_NAMES:
-            self.held.discard(MODIFIER_NAMES[name])
+        try:
+            name = getattr(key, "name", None)
+            if name in MODIFIER_NAMES:
+                self.held.discard(MODIFIER_NAMES[name])
+        except Exception as exc:
+            print(f"  [recorder] _on_release error: {exc}")
 
     # ----- run -----
+    @staticmethod
+    def _check_screenshots():
+        """Take one tiny screenshot before recording. It warms things up so the first F8 is
+        fast, and reports a missing Pillow now instead of in the middle of your recording."""
+        try:
+            pyautogui.screenshot(region=(0, 0, 10, 10))
+        except Exception as error:
+            print(f"WARNING: screenshots do not work ({error}). F8 markers will fail. "
+                  "Try: pip install pillow")
+
     def run(self):
         """Record until F9 is pressed, then return the list of actions."""
+        print("NOTE: everything you type is saved as plain text. "
+              "Press Shift+F9 to pause before typing a password.")
+        self._check_screenshots()
         for i in range(START_DELAY, 0, -1):
             print(f"Recording starts in {i}... (switch to your target window)")
             time.sleep(1)
+
+        meta = {"version": LOG_VERSION, "session": self.session,
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "screen": [int(v) for v in pyautogui.size()]}
+        self.actions = ActionLog(self.log_path, meta)   # every action is also saved to disk
         beep(1000, 200)                              # high beep = recording started
         print("Recording! Do your task now.")
-        print("  F9 = stop | F8 = image click | Shift+F8 = wait for image | Ctrl+F8 = new step")
+        print("  F9 = stop | Shift+F9 = pause/resume | F8 = image click | "
+              "Shift+F8 = wait for image | Ctrl+F8 = new step")
 
         mouse_listener = mouse.Listener(on_click=self._on_click, on_scroll=self._on_scroll)
         mouse_listener.start()                       # runs in a background thread
-        with keyboard.Listener(on_press=self._on_press,
-                               on_release=self._on_release) as kb_listener:
-            kb_listener.join()                       # waits here until F9
-        mouse_listener.stop()
+        try:
+            with keyboard.Listener(on_press=self._on_press,
+                                   on_release=self._on_release) as kb_listener:
+                kb_listener.join()                   # waits here until F9
+        finally:
+            mouse_listener.stop()
+            self.actions.close()
         beep(600, 400)                               # low beep = recording stopped
         print("Recording stopped.")
         return self.actions
@@ -388,20 +619,22 @@ class ScriptWriter:
 
     def _core_code(self, a):
         """The pyautogui line(s) for one Action (without modifiers or comment)."""
+        # Text from a recording is turned into code with repr(), so odd characters in a
+        # recording (or a hand-edited .jsonl) can never break out of the quotes.
         if a.kind == "click":
             if a.value == "left":
                 return [f"pyautogui.click({a.x}, {a.y})"]
-            return [f'pyautogui.click({a.x}, {a.y}, button="{a.value}")']
+            return [f"pyautogui.click({a.x}, {a.y}, button={a.value!r})"]
         if a.kind == "image_click":
-            extra = "" if a.value == "left" else f', button="{a.value}"'
-            return [f'click_image("{a.image}", {a.img_dx}, {a.img_dy}, {a.x}, {a.y}{extra})']
+            extra = "" if a.value == "left" else f", button={a.value!r}"
+            return [f"click_image({a.image!r}, {a.img_dx}, {a.img_dy}, {a.x}, {a.y}{extra})"]
         if a.kind == "wait_image":
-            return [f'wait_for_image("{a.image}")']
+            return [f"wait_for_image({a.image!r})"]
         if a.kind == "drag":
             duration = max(0.3, round(a.end_time - a.time, 1))   # too fast a drag can fail
             return [f"pyautogui.moveTo({a.x}, {a.y})",
-                    f'pyautogui.dragTo({a.x2}, {a.y2}, duration={duration} / SPEED, '
-                    f'button="{a.value}")']
+                    f"pyautogui.dragTo({a.x2}, {a.y2}, duration={duration} / SPEED, "
+                    f"button={a.value!r})"]
         if a.kind == "scroll":
             return [f"pyautogui.scroll({a.amount * SCROLL_UNIT}, x={a.x}, y={a.y})"]
         if a.kind == "hscroll":
@@ -410,7 +643,7 @@ class ScriptWriter:
             return [f"pyautogui.hotkey({', '.join(repr(k) for k in a.keys)})"]
         if a.kind == "text":
             return [f"pyautogui.write({a.value!r}, interval=0.05)"]
-        return [f'pyautogui.press("{a.value}")']
+        return [f"pyautogui.press({a.value!r})"]
 
     def _lines_for(self, a):
         """Full code for one Action: hold modifiers, do it, release them, add a comment."""
@@ -425,8 +658,10 @@ class ScriptWriter:
         return lines
 
     def _pause(self, a, prev_end):
-        """A time.sleep line for the gap before `a`. None if the gap is tiny, or for
-        wait-for-image, which waits by itself instead of sleeping."""
+        """A time.sleep line for the gap before `a`. None if there is no previous action,
+        if the gap is under MIN_WAIT, or if `a` is a wait-for-image (it waits by itself).
+        The gap AFTER a wait-for-image is kept: it is the time you took to react once the
+        picture appeared, and the replay should give the screen the same time to settle."""
         if prev_end is None or a.kind == "wait_image":
             return None
         gap = a.time - prev_end
@@ -443,8 +678,9 @@ class ScriptWriter:
             prev_end = a.end_time
         return body
 
-    def build(self, actions, session):
-        """Return the full text of the generated script."""
+    def build(self, actions, session, screen=None):
+        """Return the full text of the generated script.
+        `screen` is the (width, height) it was recorded on; the script warns if it differs."""
         # Sort by start time because a click/drag is saved when the button is released
         merged = self._merge(sorted(actions, key=lambda a: a.time))
         steps = self._split_steps(merged)
@@ -468,8 +704,11 @@ class ScriptWriter:
             "pyautogui.FAILSAFE = True        # mouse into a screen corner = emergency stop",
             "pyautogui.PAUSE = 0.1 / SPEED    # pyautogui's built-in pause after each action",
         ]
+        if screen:
+            width, height = (int(v) for v in screen)
+            lines += ["", f"RECORDED_SCREEN = ({width}, {height})   # screen size when this was recorded"]
         if uses_images:
-            lines += ["", IMAGE_HELPERS.replace("__FOLDER__", f"{session}_images").rstrip("\n")]
+            lines += ["", IMAGE_HELPERS.replace('"__FOLDER__"', repr(f"{session}_images")).rstrip("\n")]
 
         if len(steps) > 1:
             # Several steps: one function per step, and run_macro() calls them in order
@@ -491,10 +730,14 @@ class ScriptWriter:
                       '    """One full pass of everything you recorded."""']
             lines += ["    " + line for line in body]
 
+        lines += ["", "", 'if __name__ == "__main__":']
+        if screen:
+            lines += [
+                "    if tuple(pyautogui.size()) != RECORDED_SCREEN:",
+                '        print(f"WARNING: this screen is {tuple(pyautogui.size())} but the macro was "',
+                '              f"recorded on {RECORDED_SCREEN}. Clicks may land in the wrong place.")',
+            ]
         lines += [
-            "",
-            "",
-            'if __name__ == "__main__":',
             '    print(f"Starting in {COUNTDOWN} seconds... (mouse into a screen corner to stop)")',
             "    time.sleep(COUNTDOWN)",
             "    try:",
@@ -507,20 +750,24 @@ class ScriptWriter:
         ]
         return "\n".join(lines) + "\n"
 
-    def save(self, actions, session):
-        """Write the script next to this file and return its path."""
-        path = Path(__file__).parent / f"{session}.py"
-        path.write_text(self.build(actions, session), encoding="utf-8")
+    def save(self, actions, session, folder=None, suffix="", screen=None):
+        """Write the script (default: next to this file) and return its path.
+        The pictures folder must sit next to the script, so `folder` is where both live."""
+        folder = Path(folder) if folder else Path(__file__).parent
+        path = folder / f"{session}{suffix}.py"
+        path.write_text(self.build(actions, session, screen), encoding="utf-8")
         return path
 
 
-def main():
+def record():
+    """Record a new macro, save the recording and the script, offer to replay."""
     recorder = Recorder()
     actions = recorder.run()
+    print(f"Raw recording saved to: {recorder.log_path}")
     if not actions:
-        print("Nothing was recorded, so no file was saved.")
+        print("Nothing was recorded, so no script was made.")
         return
-    path = ScriptWriter().save(actions, recorder.session)
+    path = ScriptWriter().save(actions, recorder.session, screen=pyautogui.size())
     print(f"Saved {len(actions)} actions to: {path}")
     if recorder.image_dir.exists():
         print(f"Pictures are in: {recorder.image_dir}  (keep this folder next to the script)")
@@ -530,6 +777,39 @@ def main():
         subprocess.run([sys.executable, str(path)])
     else:
         print(f"Replay it later with:  python \"{path.name}\"")
+
+
+def generate(log_file):
+    """Rebuild a script from a saved .jsonl recording, without recording again."""
+    log_file = Path(log_file)
+    meta, actions = load_log(log_file)
+    session = Path(str(meta.get("session") or log_file.stem)).name   # names the pictures folder
+    if any(a.kind in ("image_click", "wait_image") for a in actions) \
+            and not (log_file.parent / f"{session}_images").exists():
+        print(f"Warning: the pictures folder {session}_images was not found next to the "
+              "recording. The script will stop when it needs a picture.")
+    path = ScriptWriter().save(actions, session, folder=log_file.parent,
+                               suffix="_regen", screen=meta.get("screen"))
+    print(f"Wrote {len(actions)} actions to: {path}")
+    return path
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Record your mouse and keyboard and turn them into a pyautogui script.")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("record", help="record a new macro (this is the default)")
+    gen = commands.add_parser("generate", help="rebuild a script from a saved .jsonl recording")
+    gen.add_argument("log", help="path to a macro_*.jsonl recording")
+    args = parser.parse_args(argv)
+
+    if args.command == "generate":
+        try:
+            generate(args.log)
+        except (OSError, ValueError) as error:
+            sys.exit(f"Error: {error}")
+    else:
+        record()
 
 
 if __name__ == "__main__":
