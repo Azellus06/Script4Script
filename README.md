@@ -10,7 +10,7 @@ It works in normal apps and in games, for clicking menus, walking with held keys
 pip install pynput pyautogui pillow opencv-python pydirectinput-rgx
 ```
 
-Windows only. Python 3.10 or newer.
+Built and tested on Windows. Python 3.10 or newer. See [Platform support](#platform-support) for Linux and macOS.
 
 ## Quick start
 
@@ -31,6 +31,17 @@ Everything is saved in `recordings/macro_<date>_<time>/` next to `macro_recorder
 | `macro_<date>_<time>_images/` | pictures from F8 markers (only if you used them) |
 
 Run the script with `python macro_<date>_<time>.py`. The recorder never asks anything in the terminal, so it also works from a `.pyw` launcher.
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| **Windows** | Fully supported and tested, including Roblox. |
+| **Linux (X11)** | Not tested on a real desktop; should work with `pyautogui`. Use `--backend pyautogui` (or set `BACKEND = "pyautogui"`), because `pydirectinput` is Windows-only. Screenshots may need `sudo apt install scrot python3-tk`. |
+| **Linux (Wayland)** | Global key and mouse capture is mostly blocked, so recording and replay may not work. Log in with an Xorg session instead. |
+| **macOS** | Not tested. `pynput` needs Accessibility and Input Monitoring permission. Use the `pyautogui` backend. |
+
+On non-Windows systems the Windows-only parts (start/stop beeps, the screen-scaling fix and the stuck-modifier check) are skipped automatically. There are no beeps, so watch the terminal. The game tweaks only apply to the `pydirectinput` backend.
 
 ## Hotkeys while recording
 
