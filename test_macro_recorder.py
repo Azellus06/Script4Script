@@ -14,9 +14,7 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# ---------------------------------------------------------------------------
-# Stub pynput so it loads without real hardware hooks
-# ---------------------------------------------------------------------------
+# ----- Stub pynput so it loads without real hardware hooks -----
 _pynput_stub = types.ModuleType("pynput")
 _keyboard_stub = types.ModuleType("pynput.keyboard")
 _mouse_stub = types.ModuleType("pynput.mouse")
@@ -120,9 +118,7 @@ sys.path.insert(0, str(WORKSPACE))
 import macro_recorder as mr
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ----- Helpers -----
 
 def make_key(name=None, char=None):
     """Minimal pynput Key/KeyCode fake."""
@@ -209,9 +205,7 @@ def exec_script_get_calls(actions):
 
 
 
-# ===========================================================================
-# Tests
-# ===========================================================================
+# ----- Tests -----
 
 class TestTypingMerge(unittest.TestCase):
 
@@ -2035,6 +2029,64 @@ class TestStopKey(unittest.TestCase):
     def test_stop_key_is_named_in_the_start_message(self):
         text = mr.ScriptWriter().build(self.HOLDS, "macro_x")
         self.assertIn("press {STOP_KEY.upper()}", text)
+
+
+class TestRepeat(unittest.TestCase):
+    """REPEAT = N runs N times; REPEAT = 0 runs until stopped."""
+
+    run_script = TestBackendSwitch.run_script
+    CLICK = [mr.Action("click", 1.0, x=5, y=6, value="left")]
+
+    def clicks(self, edits):
+        try:
+            events, _, _ = self.run_script(self.CLICK, edits=edits)
+        except SystemExit:
+            raise
+        return sum(1 for e in events if e[1] == "click")
+
+    def test_default_runs_once(self):
+        self.assertEqual(self.clicks([]), 1)
+
+    def test_repeat_three_runs_three_times(self):
+        self.assertEqual(self.clicks([("REPEAT = 1 ", "REPEAT = 3 ")]), 3)
+
+    def test_repeat_zero_keeps_looping_until_stopped(self):
+        # stop it after the 5th run the way F10 would: by ending the process
+        stop = [("REPEAT = 1 ", "REPEAT = 0 "),
+                ("            run_macro()\n", "            run_macro()\n            if run_number == 5: raise KeyboardInterrupt\n")]
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_script(self.CLICK, edits=stop)
+
+    def test_repeat_zero_is_explained_in_the_script(self):
+        text = mr.ScriptWriter().build(self.CLICK, "macro_x")
+        self.assertIn("0 = forever", text)
+        self.assertIn("while REPEAT == 0 or run_number < REPEAT", text)
+
+
+class TestLoopDelay(unittest.TestCase):
+
+    run_script = TestBackendSwitch.run_script
+    CLICK = [mr.Action("click", 1.0, x=5, y=6, value="left")]
+
+    def waits(self, edits):
+        events, _, _ = self.run_script(self.CLICK, edits=edits)
+        return [e[1] for e in events if e[0] == "sleep" and e[1] >= 5]
+
+    def test_no_delay_by_default(self):
+        self.assertEqual(self.waits([("REPEAT = 1 ", "REPEAT = 3 ")]), [])
+
+    def test_delay_between_runs_but_not_after_the_last(self):
+        waits = self.waits([("REPEAT = 1 ", "REPEAT = 3 "), ("LOOP_DELAY = 0 ", "LOOP_DELAY = 7 ")])
+        self.assertEqual(waits, [7, 7])              # 3 runs have 2 gaps
+
+    def test_single_run_never_waits(self):
+        self.assertEqual(self.waits([("LOOP_DELAY = 0 ", "LOOP_DELAY = 7 ")]), [])
+
+    def test_forever_loop_with_a_delay_still_runs(self):
+        stop = [("REPEAT = 1 ", "REPEAT = 0 "), ("LOOP_DELAY = 0 ", "LOOP_DELAY = 7 "),
+                ("            run_macro()\n", "            run_macro()\n            if run_number == 3: raise KeyboardInterrupt\n")]
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_script(self.CLICK, edits=stop)
 
 
 class TestRealPydirectinputNames(unittest.TestCase):

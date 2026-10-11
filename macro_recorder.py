@@ -62,7 +62,7 @@ if sys.platform == "win32":
 
 import pyautogui  # noqa: E402  (used here only to take marker screenshots)
 
-# ---------- Settings ----------
+# ----- Settings -----
 START_DELAY = 3         # seconds to switch to your target window before recording starts
 BEEP = True             # beep when recording starts/stops and when a marker is saved
 MIN_WAIT = 0.3          # pauses shorter than this don't become time.sleep() lines
@@ -150,7 +150,7 @@ def keys_to_hold(action):
 
 # Code pasted into generated scripts that use pictures. __FOLDER__ is replaced
 # with the name of the picture folder.
-IMAGE_HELPERS = '''# ---------- Picture helpers (used by image clicks and wait-for-image) ----------
+IMAGE_HELPERS = '''# ----- Picture helpers (used by image clicks and wait-for-image) -----
 IMAGE_DIR = Path(__file__).parent / "__FOLDER__"   # folder with the marker pictures
 CONFIDENCE = 0.8     # how close a match must be, 0.0-1.0 (lower = more forgiving)
 IMAGE_TIMEOUT = 5    # seconds to look for a picture before clicking the old spot instead
@@ -194,7 +194,7 @@ def wait_for_image(name):
 
 # Code pasted into every generated script: picks the library that does the clicking and typing.
 # Everything the script does goes through "inp", so flipping BACKEND at the top is all it takes.
-BACKEND_BLOCK = '''# ---------- Input library ("inp" below is whichever one BACKEND names) ----------
+BACKEND_BLOCK = '''# ----- Input library ("inp" below is whichever one BACKEND names) -----
 if BACKEND == "pydirectinput":
     try:
         import pydirectinput   # install with: pip install pydirectinput-rgx
@@ -261,7 +261,7 @@ else:
 
 # Code pasted into every generated script: a key that stops the replay at any moment.
 # __KEYS__ and __BUTTONS__ are replaced with what that script can leave pressed.
-STOP_BLOCK = '''# ---------- Stop key ----------
+STOP_BLOCK = '''# ----- Stop key -----
 HELD_KEYS = __KEYS__        # keys this macro presses and holds
 HELD_BUTTONS = __BUTTONS__  # mouse buttons it holds
 
@@ -961,7 +961,7 @@ class ScriptWriter:
             lines.append("from pathlib import Path")
         lines += [
             "",
-            "# ---------- Settings (edit these) ----------",
+            "# ----- Settings (edit these) -----",
             f'BACKEND = "{backend}"   # "pydirectinput" works in games (Roblox...); "pyautogui" is for normal apps',
             "SPEED = 1.0      # 2.0 = twice as fast, 0.5 = half speed (divides every wait)",
             "REPEAT = 1       # how many times to run the whole macro (0 = forever, until you press the stop key)",
